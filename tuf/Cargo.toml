@@ -22,7 +22,7 @@ data-encoding = "2.0.0-rc.2"
 futures-io = "0.3.1"
 futures-util = { version = "0.3.1", features = [ "io" ] }
 http = "0.2.0"
-hyper = { version = "0.14.15", default-features = false, features = [ "stream", "client", "http1" ], optional = true }
+hyper = { version = "1.0.0", default-features = false, features = [ "stream", "client", "http1" ], optional = true }
 itoa = "1.0"
 log = "0.4"
 percent-encoding = "2.1"
