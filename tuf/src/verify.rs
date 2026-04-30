@@ -102,8 +102,12 @@ where
         .map(|k| (k.key_id(), k))
         .collect::<HashMap<&KeyId, &PublicKey>>();
 
-    // Extract the signatures and canonicalize the bytes.
-    let (signatures, canonical_bytes) = {
+    // Extract the signatures, canonicalize the signed bytes, and keep the parsed `signed` value
+    // around so we can deserialize the verified metadata from it without re-parsing the canonical
+    // bytes. OLPC canonical JSON keeps literal control characters (e.g. embedded newlines in PEM
+    // strings used for ECDSA keys), so the canonical-bytes form is not always re-parseable as
+    // strict JSON.
+    let (signatures, canonical_bytes, signed_value) = {
         #[derive(Deserialize)]
         pub struct SignedMetadata<D: DataInterchange> {
             signatures: Vec<Signature>,
@@ -113,7 +117,7 @@ where
         let unverified: SignedMetadata<D> = D::from_slice(raw_metadata.as_bytes())?;
 
         let canonical_bytes = D::canonicalize(&unverified.signed)?;
-        (unverified.signatures, canonical_bytes)
+        (unverified.signatures, canonical_bytes, unverified.signed)
     };
 
     let mut signatures_needed = threshold;
@@ -155,13 +159,11 @@ where
         });
     }
 
-    // Everything looks good so deserialize the metadata.
-    //
-    // Note: Canonicalization (or any other transformation of data) could modify or filter out
-    // information about the data. Therefore, while we've confirmed the canonical bytes are signed,
-    // we shouldn't interpret this as if the raw bytes were signed. So we deserialize from the
-    // `canonical_bytes`, rather than from `raw_meta.as_bytes()`.
-    let verified_metadata = D::from_slice(&canonical_bytes)?;
+    // Everything looks good so deserialize the metadata. We use the already-parsed `signed` value
+    // (which the canonical-bytes signature check covers) instead of re-parsing the canonical
+    // bytes, which is necessary because OLPC canonical JSON contains literal control characters
+    // and is therefore not strictly re-parseable as JSON.
+    let verified_metadata = D::deserialize(&signed_value)?;
 
     Ok(Verified::new(verified_metadata))
 }

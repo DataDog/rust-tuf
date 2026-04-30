@@ -307,10 +307,26 @@ impl Value {
                 .map(|_| ())
                 .map_err(|err| format!("Write error: {}", err)),
             Value::String(ref s) => {
-                // this mess is abusing serde_json to get json escaping
-                let s = serde_json::Value::String(s.clone());
-                let s = serde_json::to_string(&s).map_err(|e| format!("{:?}", e))?;
-                buf.extend(s.as_bytes());
+                // OLPC Canonical JSON (https://wiki.laptop.org/go/Canonical_JSON, the encoding
+                // python-tuf and go-tuf both use) escapes ONLY backslash and double-quote inside
+                // string values; all other bytes — including control characters like LF — are
+                // emitted literally. This is intentionally not standard-JSON-compliant, but it is
+                // the byte-for-byte form keyids and signatures are computed over.
+                //
+                // Earlier versions of this encoder routed through `serde_json::to_string`, which
+                // escapes `\n` / `\t` / etc. That produced the right keyids for hex-encoded
+                // (ed25519) and base64url-encoded (RSA) keyvals — neither of which contain
+                // control characters — but the wrong keyids for any metadata containing literal
+                // newlines, e.g. PEM-encoded ECDSA public keys.
+                buf.push(b'"');
+                for &byte in s.as_bytes() {
+                    match byte {
+                        b'\\' => buf.extend_from_slice(b"\\\\"),
+                        b'"' => buf.extend_from_slice(b"\\\""),
+                        other => buf.push(other),
+                    }
+                }
+                buf.push(b'"');
                 Ok(())
             }
             Value::Array(ref arr) => {
@@ -412,12 +428,32 @@ mod test {
         let mut map = BTreeMap::new();
         let arr = Value::Array(vec![
             Value::String(String::from("haha")),
+            // OLPC canonical JSON keeps control characters literal — the LF byte stays as 0x0a.
             Value::String(String::from("new\nline")),
         ]);
         let _ = map.insert(String::from("lol"), arr);
         let jsn = Value::Object(map);
         let mut out = Vec::new();
         jsn.write(&mut out).unwrap();
-        assert_eq!(&out, &b"{\"lol\":[\"haha\",\"new\\nline\"]}");
+        assert_eq!(&out, &b"{\"lol\":[\"haha\",\"new\nline\"]}");
+    }
+
+    #[test]
+    fn write_string_olpc_only_escapes_quote_and_backslash() {
+        for (input, expected) in [
+            // Backslash and double-quote get escaped.
+            ("\\", b"\"\\\\\"" as &[u8]),
+            ("\"", b"\"\\\"\""),
+            ("a\\b\"c", b"\"a\\\\b\\\"c\""),
+            // Other control characters are NOT escaped.
+            ("a\nb", b"\"a\nb\""),
+            ("\t\r\x08\x0c", b"\"\t\r\x08\x0c\""),
+            // Non-ASCII UTF-8 is emitted literally.
+            ("résumé", "\"résumé\"".as_bytes()),
+        ] {
+            let mut out = Vec::new();
+            Value::String(input.to_string()).write(&mut out).unwrap();
+            assert_eq!(&out, expected, "input was {:?}", input);
+        }
     }
 }
