@@ -218,7 +218,7 @@ fn shim_public_key(
             // PEM SPKI string emitted verbatim so the keyid matches what the signer computed.
             std::str::from_utf8(public_key)
                 .map_err(|err| {
-                    Error::Encoding(format!("ECDSA public key was not valid UTF-8: {:?}", err))
+                    Error::Encoding(format!("ECDSA public key was not valid UTF-8: {err:?}"))
                 })?
                 .to_string()
         }
@@ -884,7 +884,7 @@ impl PublicKey {
 /// PEM SPKI (NIST P-256) → raw uncompressed EC point (`0x04 || X || Y`).
 fn ec_point_from_pem_spki(pem: &[u8]) -> Result<Vec<u8>> {
     let text = std::str::from_utf8(pem)
-        .map_err(|err| Error::Encoding(format!("ECDSA PEM was not valid UTF-8: {:?}", err)))?;
+        .map_err(|err| Error::Encoding(format!("ECDSA PEM was not valid UTF-8: {err:?}")))?;
 
     let start = text
         .find("-----BEGIN PUBLIC KEY-----")
@@ -895,9 +895,9 @@ fn ec_point_from_pem_spki(pem: &[u8]) -> Result<Vec<u8>> {
         .ok_or_else(|| Error::Encoding("ECDSA PEM missing END PUBLIC KEY marker".into()))?;
     let body = &text[after_begin..after_begin + end];
 
-    let der = BASE64_MIME.decode(body.as_bytes()).map_err(|err| {
-        Error::Encoding(format!("ECDSA PEM body was not valid base64: {:?}", err))
-    })?;
+    let der = BASE64_MIME
+        .decode(body.as_bytes())
+        .map_err(|err| Error::Encoding(format!("ECDSA PEM body was not valid base64: {err:?}")))?;
 
     let input = Input::from(&der);
     let point = input
@@ -1025,7 +1025,7 @@ impl<'de> Deserialize<'de> for PublicKey {
                 // Validate the PEM parses as P-256 SPKI; store the bytes verbatim for keyid.
                 let pem_bytes = intermediate.public_key().as_bytes().to_vec();
                 ec_point_from_pem_spki(&pem_bytes).map_err(|e| {
-                    DeserializeError::custom(format!("Couldn't parse ECDSA P-256 key: {:?}", e))
+                    DeserializeError::custom(format!("Couldn't parse ECDSA P-256 key: {e:?}"))
                 })?;
                 PublicKey::new(
                     KeyType::Ecdsa,
@@ -1034,7 +1034,7 @@ impl<'de> Deserialize<'de> for PublicKey {
                     pem_bytes,
                 )
                 .map_err(|e| {
-                    DeserializeError::custom(format!("Couldn't construct ECDSA PublicKey: {:?}", e))
+                    DeserializeError::custom(format!("Couldn't construct ECDSA PublicKey: {e:?}"))
                 })?
             }
             KeyType::Unknown(_) => {

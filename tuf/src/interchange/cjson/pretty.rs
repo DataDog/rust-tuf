@@ -1,5 +1,6 @@
 use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
+use serde_json::{Map, Value};
 
 use super::Json;
 use crate::interchange::DataInterchange;
@@ -126,20 +127,18 @@ impl DataInterchange for JsonPretty {
 
 /// Rebuild a `Value` with every object's keys inserted in sorted order, so re-serialization
 /// emits them sorted regardless of whether `serde_json::Map` is `BTreeMap` or `IndexMap`.
-fn with_sorted_keys(value: &serde_json::Value) -> serde_json::Value {
+fn with_sorted_keys(value: &Value) -> Value {
     match value {
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+        Value::Object(map) => {
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
-            let mut sorted = serde_json::Map::with_capacity(entries.len());
+            let mut sorted = Map::with_capacity(entries.len());
             for (k, v) in entries {
                 sorted.insert(k.clone(), with_sorted_keys(v));
             }
-            serde_json::Value::Object(sorted)
+            Value::Object(sorted)
         }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(with_sorted_keys).collect())
-        }
+        Value::Array(arr) => Value::Array(arr.iter().map(with_sorted_keys).collect()),
         other => other.clone(),
     }
 }
