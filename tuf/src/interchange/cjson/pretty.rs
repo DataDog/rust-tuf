@@ -57,17 +57,8 @@ impl DataInterchange for JsonPretty {
     /// }"#);
     /// ```
     fn canonicalize(raw_data: &Self::RawData) -> Result<Vec<u8>> {
-        // We explicitly normalise the `Value`'s key order before pretty-printing rather than
-        // relying on `serde_json::Map`'s underlying type. Cargo features are unioned across the
-        // workspace, so any consumer that pulls in `serde_json/preserve_order` (e.g. anything
-        // depending on Vector) makes `Value::Object` an `IndexMap`, in which case
-        // `to_vec_pretty` would emit keys in insertion order and break this method's contract.
-        //
-        // The earlier "canonicalize → from_slice → pretty" round-trip used to provide this
-        // sorting indirectly, but that path also re-parsed the canonical bytes through
-        // `serde_json::from_slice` — which fails on the literal control characters OLPC
-        // canonical JSON emits inside string values (e.g. embedded newlines in PEM-encoded
-        // ECDSA keys).
+        // Sort explicitly: `Value::Object` is `IndexMap` (insertion order) when any workspace
+        // crate enables `serde_json/preserve_order`, so we can't rely on the `Map` type alone.
         Ok(serde_json::to_vec_pretty(&with_sorted_keys(raw_data))?)
     }
 
@@ -133,14 +124,8 @@ impl DataInterchange for JsonPretty {
     }
 }
 
-/// Recursively rebuild a `serde_json::Value` so every object's keys are emitted in sorted order
-/// when re-serialized, regardless of whether `serde_json` was built with the `preserve_order`
-/// feature (which swaps `Map`'s underlying type from `BTreeMap` to `IndexMap`).
-///
-/// When `preserve_order` is enabled, `Map::insert` preserves insertion order, so inserting in
-/// sorted order produces a map that iterates in sorted order. When it is not enabled, `Map`
-/// uses `BTreeMap`, which always iterates in sorted order; the explicit sort here is then a
-/// no-op on the iteration order but still produces an equivalent value.
+/// Rebuild a `Value` with every object's keys inserted in sorted order, so re-serialization
+/// emits them sorted regardless of whether `serde_json::Map` is `BTreeMap` or `IndexMap`.
 fn with_sorted_keys(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
@@ -164,11 +149,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Regression test: prior to skipping the canonical-bytes round-trip, calling
-    /// `JsonPretty::canonicalize` on any value containing a string with control characters (an
-    /// embedded newline, tab, etc.) failed with a "control character while parsing a string"
-    /// error from `serde_json::from_slice`, because OLPC canonical JSON emits those bytes
-    /// literally and that form is not strict JSON.
+    /// Strings with control characters (literal newlines from PEM keyvals, tabs, etc.) must
+    /// canonicalize without error.
     #[test]
     fn canonicalize_handles_strings_with_control_characters() {
         let value = json!({
@@ -186,14 +168,10 @@ mod tests {
         assert!(s.find("key_with_newlines").unwrap() < s.find("key_with_tab").unwrap());
     }
 
-    /// `JsonPretty::canonicalize` must emit object keys in sorted order regardless of whether
-    /// `serde_json` was built with `preserve_order` (which swaps `Map`'s underlying type from
-    /// `BTreeMap` to `IndexMap`). The test build for this crate enables `preserve_order` via a
-    /// `[dev-dependencies]` declaration in `tuf/Cargo.toml`, so this assertion runs against the
-    /// `IndexMap` code path on every `cargo test` invocation — the same map type any consumer
-    /// that depends on Vector (or another `preserve_order` consumer) sees in production.
-    /// Inserting keys in reverse-alphabetical order ensures that any code path which simply
-    /// iterates the map without sorting would emit them in the wrong order.
+    /// Object keys must come out sorted even when the underlying `Map` preserves insertion
+    /// order (`tuf/Cargo.toml` enables `serde_json/preserve_order` as a dev-dep so this runs
+    /// against `IndexMap`). Inserting in reverse-alphabetical order would otherwise yield
+    /// reverse-alphabetical output if the canonicalizer didn't explicitly sort.
     #[test]
     fn canonicalize_sorts_keys_recursively_against_insertion_order() {
         let mut top = serde_json::Map::new();

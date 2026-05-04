@@ -307,17 +307,8 @@ impl Value {
                 .map(|_| ())
                 .map_err(|err| format!("Write error: {}", err)),
             Value::String(ref s) => {
-                // OLPC Canonical JSON (https://wiki.laptop.org/go/Canonical_JSON, the encoding
-                // python-tuf and go-tuf both use) escapes ONLY backslash and double-quote inside
-                // string values; all other bytes — including control characters like LF — are
-                // emitted literally. This is intentionally not standard-JSON-compliant, but it is
-                // the byte-for-byte form keyids and signatures are computed over.
-                //
-                // Earlier versions of this encoder routed through `serde_json::to_string`, which
-                // escapes `\n` / `\t` / etc. That produced the right keyids for hex-encoded
-                // (ed25519) and base64url-encoded (RSA) keyvals — neither of which contain
-                // control characters — but the wrong keyids for any metadata containing literal
-                // newlines, e.g. PEM-encoded ECDSA public keys.
+                // OLPC Canonical JSON (https://wiki.laptop.org/go/Canonical_JSON): escape only
+                // `\` and `"`; all other bytes — including control chars — emit literally.
                 buf.push(b'"');
                 for &byte in s.as_bytes() {
                     match byte {

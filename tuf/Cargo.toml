@@ -42,14 +42,8 @@ futures-executor = "0.3.1"
 lazy_static = "1"
 maplit = "1"
 pretty_assertions = "1"
-# Force `serde_json` into `preserve_order` mode for the entire test build so unit tests can
-# verify sorting code paths (e.g. `JsonPretty::canonicalize`) still produce sorted output when
-# `serde_json::Value::Object` is backed by `IndexMap` rather than `BTreeMap`. Cargo unifies
-# features across the active build, so this dev-dependency flips the map type at test-compile
-# time without affecting the published library's default `cargo build` output. This mirrors what
-# any consumer that depends on Vector (or anything else enabling `serde_json/preserve_order`)
-# sees in production — without it the relevant assertions are vacuous since `BTreeMap` always
-# iterates in sorted order regardless of insertion sequence.
+# Flip `serde_json::Map` to `IndexMap` during `cargo test` so sort-dependent assertions are
+# meaningful (matches what consumers like Vector enable in production).
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [features]

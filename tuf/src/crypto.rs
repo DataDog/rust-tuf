@@ -215,9 +215,7 @@ fn shim_public_key(
             BASE64URL.encode(&bytes)
         }
         (KeyType::Ecdsa, SignatureScheme::EcdsaSha2Nistp256) => {
-            // ECDSA keys in canonical TUF metadata are stored as PEM-encoded SPKI strings.
-            // We hold the original PEM bytes verbatim in `value` so the keyid round-trips
-            // bit-identically with whatever signer produced the metadata.
+            // PEM SPKI string emitted verbatim so the keyid matches what the signer computed.
             std::str::from_utf8(public_key)
                 .map_err(|err| {
                     Error::Encoding(format!("ECDSA public key was not valid UTF-8: {:?}", err))
@@ -323,9 +321,7 @@ pub enum SignatureScheme {
     #[cfg(feature = "unstable_rsa")]
     RsaSsaPssSha512,
 
-    /// [ECDSA](https://en.wikipedia.org/wiki/Elliptic_Curve_Digital_Signature_Algorithm)
-    /// over the NIST P-256 curve, with SHA-256 as the hash algorithm and ASN.1 DER encoding for
-    /// the signature value (TUF scheme name `ecdsa-sha2-nistp256`).
+    /// ECDSA over NIST P-256 with SHA-256 and ASN.1 DER signature encoding.
     EcdsaSha2Nistp256,
 
     /// Placeholder for an unknown scheme.
@@ -341,8 +337,7 @@ impl SignatureScheme {
             "rsassa-pss-sha256" => SignatureScheme::RsaSsaPssSha256,
             #[cfg(feature = "unstable_rsa")]
             "rsassa-pss-sha512" => SignatureScheme::RsaSsaPssSha512,
-            // Some metadata producers serialize the scheme as the bare alias `ecdsa`; the
-            // canonical name (TUF spec ≥ 1.0.32) is `ecdsa-sha2-nistp256`.
+            // `ecdsa` is the bare alias TUF spec ≥ 1.0.32 permits.
             "ecdsa-sha2-nistp256" | "ecdsa" => SignatureScheme::EcdsaSha2Nistp256,
             scheme => SignatureScheme::Unknown(scheme.to_string()),
         }
@@ -421,9 +416,7 @@ pub enum KeyType {
     #[cfg(feature = "unstable_rsa")]
     Rsa,
 
-    /// [ECDSA](https://en.wikipedia.org/wiki/Elliptic_Curve_Digital_Signature_Algorithm) — the
-    /// curve is determined by the paired `SignatureScheme` (currently only NIST P-256 / `secp256r1`
-    /// is supported).
+    /// ECDSA. Curve is set by the paired `SignatureScheme` (only P-256 supported).
     Ecdsa,
 
     /// Placeholder for an unknown key type.
@@ -471,8 +464,7 @@ impl KeyType {
             KeyType::Ed25519 => Ok(ED25519_SPKI_OID),
             #[cfg(feature = "unstable_rsa")]
             KeyType::Rsa => Ok(RSA_SPKI_OID),
-            // ECDSA SPKI uses two OIDs (id-ecPublicKey + curve OID); we don't go through
-            // `as_oid` for ECDSA because we hold the PEM/SPKI verbatim instead of synthesizing it.
+            // ECDSA SPKI has two OIDs (id-ecPublicKey + curve); we never synthesize it.
             KeyType::Ecdsa => Err(Error::UnknownKeyType("ecdsa".into())),
             KeyType::Unknown(ref s) => Err(Error::UnknownKeyType(s.clone())),
         }
@@ -860,9 +852,7 @@ impl PublicKey {
 
     /// Use this key to verify a message with a signature.
     pub fn verify(&self, role: &MetadataPath, msg: &[u8], sig: &Signature) -> Result<()> {
-        // ECDSA keys hold the original PEM-encoded SPKI bytes in `value` so the keyid round-trips
-        // bit-identically with the canonical TUF metadata. Extract the raw uncompressed EC point
-        // (`0x04 || X || Y`) on the verify path so ring can consume it directly.
+        // ECDSA: `value` holds the PEM SPKI; ring wants the raw uncompressed EC point.
         let ec_point;
         let alg: &dyn ring::signature::VerificationAlgorithm = match self.scheme {
             SignatureScheme::Ed25519 => &ED25519,
@@ -891,9 +881,7 @@ impl PublicKey {
     }
 }
 
-/// Decode a PEM-encoded SubjectPublicKeyInfo containing an `id-ecPublicKey` over the NIST P-256
-/// curve and return the raw uncompressed EC point bytes (`0x04 || X(32) || Y(32)`) suitable for
-/// `ring`'s ECDSA verifier.
+/// PEM SPKI (NIST P-256) → raw uncompressed EC point (`0x04 || X || Y`).
 fn ec_point_from_pem_spki(pem: &[u8]) -> Result<Vec<u8>> {
     let text = std::str::from_utf8(pem)
         .map_err(|err| Error::Encoding(format!("ECDSA PEM was not valid UTF-8: {:?}", err)))?;
@@ -1034,9 +1022,7 @@ impl<'de> Deserialize<'de> for PublicKey {
                         intermediate.scheme()
                     )));
                 }
-                // Validate the PEM is parseable as a P-256 SPKI before accepting the key — but
-                // store the original PEM bytes verbatim so the keyid is computed against the
-                // exact canonical-JSON form the metadata signer used.
+                // Validate the PEM parses as P-256 SPKI; store the bytes verbatim for keyid.
                 let pem_bytes = intermediate.public_key().as_bytes().to_vec();
                 ec_point_from_pem_spki(&pem_bytes).map_err(|e| {
                     DeserializeError::custom(format!("Couldn't parse ECDSA P-256 key: {:?}", e))
@@ -1273,10 +1259,8 @@ mod test {
     }
 
     mod ecdsa {
-        // Synthetic root metadata signed with two ECDSA P-256 keypairs generated specifically
-        // for this test. `.json` is the standard-JSON wire form; `.canonical` is the matching
-        // OLPC-canonical bytes of the `signed` body — i.e. exactly what the signatures cover.
-        // Together these exercise the full deserialize → keyid-recompute → ECDSA-verify path.
+        // Synthetic 2-of-2 ECDSA P-256-signed root. `.canonical` is the OLPC-canonical signed
+        // body the signatures cover.
         pub(super) const ECDSA_ROOT: &[u8] = include_bytes!("../tests/ecdsa/ecdsa_root.json");
         pub(super) const ECDSA_ROOT_CANONICAL: &[u8] =
             include_bytes!("../tests/ecdsa/ecdsa_root.canonical");
@@ -1820,10 +1804,7 @@ mod test {
         check_public_key_hash(key1.public(), key2.public());
     }
 
-    /// Deserialize a real ECDSA-signed root, recompute keyids for each key, and confirm they
-    /// match the keyids stamped in the metadata. This is the round-trip the `Unknown` fallback
-    /// was getting wrong (control characters in PEM strings escaped to `\n` instead of staying
-    /// literal).
+    /// Recomputed ECDSA keyids must match the stamped keyids in the root.
     #[test]
     fn deserialize_ecdsa_keys_keyids_match() {
         let root: serde_json::Value = serde_json::from_slice(ecdsa::ECDSA_ROOT).unwrap();
@@ -1850,18 +1831,13 @@ mod test {
         }
     }
 
-    /// Verify each ECDSA signature on the test root against its declared key. This exercises
-    /// the PEM → SPKI → EC point extraction and the `ECDSA_P256_SHA256_ASN1` path through `ring`.
+    /// Each ECDSA signature on the test root must verify against its declared key.
     #[test]
     fn verify_ecdsa_signatures_against_canonical_signed_body() {
         let root: serde_json::Value = serde_json::from_slice(ecdsa::ECDSA_ROOT).unwrap();
         let signed_keys = root["signed"]["keys"].as_object().unwrap();
         let signatures = root["signatures"].as_array().unwrap();
         let role = MetadataPath::root();
-
-        // The canonical signed bytes were produced by the OLPC canonical-JSON encoder when the
-        // fixture was generated; including them rather than re-canonicalizing here keeps this
-        // test focused on signature verification (not the canonicalizer, which has its own tests).
         let msg = ecdsa::ECDSA_ROOT_CANONICAL;
         assert!(!signatures.is_empty(), "test root must have signatures");
 
@@ -1878,8 +1854,6 @@ mod test {
         }
     }
 
-    /// `SignatureScheme::new` must round-trip the canonical `ecdsa-sha2-nistp256` name and also
-    /// accept the bare `ecdsa` alias the spec permits.
     #[test]
     fn ecdsa_signature_scheme_aliases() {
         assert_eq!(
@@ -1907,7 +1881,6 @@ mod test {
         let key: PublicKey = serde_json::from_value(key_json).unwrap();
 
         let mut bad_value = sig.value().0.clone();
-        // Flip the last byte of the DER-encoded signature so the s-value no longer matches.
         if let Some(last) = bad_value.last_mut() {
             *last ^= 0x01;
         }

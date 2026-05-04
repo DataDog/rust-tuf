@@ -102,11 +102,9 @@ where
         .map(|k| (k.key_id(), k))
         .collect::<HashMap<&KeyId, &PublicKey>>();
 
-    // Extract the signatures, canonicalize the signed bytes, and keep the parsed `signed` value
-    // around so we can deserialize the verified metadata from it without re-parsing the canonical
-    // bytes. OLPC canonical JSON keeps literal control characters (e.g. embedded newlines in PEM
-    // strings used for ECDSA keys), so the canonical-bytes form is not always re-parseable as
-    // strict JSON.
+    // Keep the parsed `signed` value so we can deserialize from it below without re-parsing
+    // the canonical bytes (which aren't strict JSON: OLPC canonical form leaves control chars
+    // literal).
     let (signatures, canonical_bytes, signed_value) = {
         #[derive(Deserialize)]
         pub struct SignedMetadata<D: DataInterchange> {
@@ -159,10 +157,8 @@ where
         });
     }
 
-    // Everything looks good so deserialize the metadata. We use the already-parsed `signed` value
-    // (which the canonical-bytes signature check covers) instead of re-parsing the canonical
-    // bytes, which is necessary because OLPC canonical JSON contains literal control characters
-    // and is therefore not strictly re-parseable as JSON.
+    // Deserialize from the already-parsed `signed` value; the canonical bytes (which the
+    // signatures cover) are intentionally not strict JSON, so `from_slice` on them would fail.
     let verified_metadata = D::deserialize(&signed_value)?;
 
     Ok(Verified::new(verified_metadata))
