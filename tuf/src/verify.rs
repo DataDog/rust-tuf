@@ -102,8 +102,10 @@ where
         .map(|k| (k.key_id(), k))
         .collect::<HashMap<&KeyId, &PublicKey>>();
 
-    // Extract the signatures and canonicalize the bytes.
-    let (signatures, canonical_bytes) = {
+    // Keep the parsed `signed` value so we can deserialize from it below without re-parsing
+    // the canonical bytes (which aren't strict JSON: OLPC canonical form leaves control chars
+    // literal).
+    let (signatures, canonical_bytes, signed_value) = {
         #[derive(Deserialize)]
         pub struct SignedMetadata<D: DataInterchange> {
             signatures: Vec<Signature>,
@@ -113,7 +115,7 @@ where
         let unverified: SignedMetadata<D> = D::from_slice(raw_metadata.as_bytes())?;
 
         let canonical_bytes = D::canonicalize(&unverified.signed)?;
-        (unverified.signatures, canonical_bytes)
+        (unverified.signatures, canonical_bytes, unverified.signed)
     };
 
     let mut signatures_needed = threshold;
@@ -155,13 +157,9 @@ where
         });
     }
 
-    // Everything looks good so deserialize the metadata.
-    //
-    // Note: Canonicalization (or any other transformation of data) could modify or filter out
-    // information about the data. Therefore, while we've confirmed the canonical bytes are signed,
-    // we shouldn't interpret this as if the raw bytes were signed. So we deserialize from the
-    // `canonical_bytes`, rather than from `raw_meta.as_bytes()`.
-    let verified_metadata = D::from_slice(&canonical_bytes)?;
+    // Deserialize from the already-parsed `signed` value; the canonical bytes (which the
+    // signatures cover) are intentionally not strict JSON, so `from_slice` on them would fail.
+    let verified_metadata = D::deserialize(&signed_value)?;
 
     Ok(Verified::new(verified_metadata))
 }

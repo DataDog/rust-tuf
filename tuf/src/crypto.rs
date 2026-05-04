@@ -1,14 +1,14 @@
 //! Cryptographic structures and functions.
 
 use {
-    data_encoding::HEXLOWER,
+    data_encoding::{BASE64_MIME, HEXLOWER},
     derp::{self, Der, Tag},
     futures_io::AsyncRead,
     futures_util::AsyncReadExt as _,
     ring::{
         digest::{self, SHA256, SHA512},
         rand::SystemRandom,
-        signature::{Ed25519KeyPair, KeyPair, ED25519},
+        signature::{Ed25519KeyPair, KeyPair, ECDSA_P256_SHA256_ASN1, ED25519},
     },
     serde::{
         de::{Deserialize, Deserializer, Error as DeserializeError},
@@ -51,6 +51,12 @@ const RSA_SPKI_OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x
 
 /// 1.3.101.112 curveEd25519(EdDSA 25519 signature algorithm)
 const ED25519_SPKI_OID: &[u8] = &[0x2b, 0x65, 0x70];
+
+/// 1.2.840.10045.2.1 id-ecPublicKey
+const EC_PUBLIC_KEY_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+/// 1.2.840.10045.3.1.7 secp256r1 (NIST P-256)
+const P256_OID: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 
 /// The length of an ed25519 private key in bytes
 const ED25519_PRIVATE_KEY_LENGTH: usize = 32;
@@ -208,6 +214,14 @@ fn shim_public_key(
             let bytes = write_spki(public_key, key_type).map_err(derp_error_to_error)?;
             BASE64URL.encode(&bytes)
         }
+        (KeyType::Ecdsa, SignatureScheme::EcdsaSha2Nistp256) => {
+            // PEM SPKI string emitted verbatim so the keyid matches what the signer computed.
+            std::str::from_utf8(public_key)
+                .map_err(|err| {
+                    Error::Encoding(format!("ECDSA public key was not valid UTF-8: {err:?}"))
+                })?
+                .to_string()
+        }
         (_, _) => {
             // We don't understand this key type and/or signature scheme, so we left it as a UTF-8 string.
             std::str::from_utf8(public_key)
@@ -307,6 +321,9 @@ pub enum SignatureScheme {
     #[cfg(feature = "unstable_rsa")]
     RsaSsaPssSha512,
 
+    /// ECDSA over NIST P-256 with SHA-256 and ASN.1 DER signature encoding.
+    EcdsaSha2Nistp256,
+
     /// Placeholder for an unknown scheme.
     Unknown(String),
 }
@@ -320,6 +337,8 @@ impl SignatureScheme {
             "rsassa-pss-sha256" => SignatureScheme::RsaSsaPssSha256,
             #[cfg(feature = "unstable_rsa")]
             "rsassa-pss-sha512" => SignatureScheme::RsaSsaPssSha512,
+            // `ecdsa` is the bare alias TUF spec ≥ 1.0.32 permits.
+            "ecdsa-sha2-nistp256" | "ecdsa" => SignatureScheme::EcdsaSha2Nistp256,
             scheme => SignatureScheme::Unknown(scheme.to_string()),
         }
     }
@@ -332,6 +351,7 @@ impl SignatureScheme {
             SignatureScheme::RsaSsaPssSha256 => "rsassa-pss-sha256",
             #[cfg(feature = "unstable_rsa")]
             SignatureScheme::RsaSsaPssSha512 => "rsassa-pss-sha512",
+            SignatureScheme::EcdsaSha2Nistp256 => "ecdsa-sha2-nistp256",
             SignatureScheme::Unknown(ref s) => s,
         }
     }
@@ -396,6 +416,9 @@ pub enum KeyType {
     #[cfg(feature = "unstable_rsa")]
     Rsa,
 
+    /// ECDSA. Curve is set by the paired `SignatureScheme` (only P-256 supported).
+    Ecdsa,
+
     /// Placeholder for an unknown key type.
     Unknown(String),
 }
@@ -407,6 +430,7 @@ impl KeyType {
             "ed25519" => KeyType::Ed25519,
             #[cfg(feature = "unstable_rsa")]
             "rsa" => KeyType::Rsa,
+            "ecdsa" => KeyType::Ecdsa,
             keytype => KeyType::Unknown(keytype.to_string()),
         }
     }
@@ -417,6 +441,7 @@ impl KeyType {
             KeyType::Ed25519 => "ed25519",
             #[cfg(feature = "unstable_rsa")]
             KeyType::Rsa => "rsa",
+            KeyType::Ecdsa => "ecdsa",
             KeyType::Unknown(ref s) => s,
         }
     }
@@ -426,6 +451,7 @@ impl KeyType {
             #[cfg(feature = "unstable_rsa")]
             x if x == RSA_SPKI_OID => Ok(KeyType::Rsa),
             x if x == ED25519_SPKI_OID => Ok(KeyType::Ed25519),
+            x if x == EC_PUBLIC_KEY_OID => Ok(KeyType::Ecdsa),
             x => Err(Error::Encoding(format!(
                 "Unknown OID: {}",
                 x.iter().map(|b| format!("{:x}", b)).collect::<String>()
@@ -438,6 +464,8 @@ impl KeyType {
             KeyType::Ed25519 => Ok(ED25519_SPKI_OID),
             #[cfg(feature = "unstable_rsa")]
             KeyType::Rsa => Ok(RSA_SPKI_OID),
+            // ECDSA SPKI has two OIDs (id-ecPublicKey + curve); we never synthesize it.
+            KeyType::Ecdsa => Err(Error::UnknownKeyType("ecdsa".into())),
             KeyType::Unknown(ref s) => Err(Error::UnknownKeyType(s.clone())),
         }
     }
@@ -824,21 +852,75 @@ impl PublicKey {
 
     /// Use this key to verify a message with a signature.
     pub fn verify(&self, role: &MetadataPath, msg: &[u8], sig: &Signature) -> Result<()> {
+        // ECDSA: `value` holds the PEM SPKI; ring wants the raw uncompressed EC point.
+        let ec_point;
         let alg: &dyn ring::signature::VerificationAlgorithm = match self.scheme {
             SignatureScheme::Ed25519 => &ED25519,
             #[cfg(feature = "unstable_rsa")]
             SignatureScheme::RsaSsaPssSha256 => &RSA_PSS_2048_8192_SHA256,
             #[cfg(feature = "unstable_rsa")]
             SignatureScheme::RsaSsaPssSha512 => &RSA_PSS_2048_8192_SHA512,
+            SignatureScheme::EcdsaSha2Nistp256 => &ECDSA_P256_SHA256_ASN1,
             SignatureScheme::Unknown(ref s) => {
                 return Err(Error::UnknownSignatureScheme(s.to_string()));
             }
         };
 
-        let key = ring::signature::UnparsedPublicKey::new(alg, &self.value.0);
+        let key_bytes: &[u8] = match self.scheme {
+            SignatureScheme::EcdsaSha2Nistp256 => {
+                ec_point = ec_point_from_pem_spki(&self.value.0)
+                    .map_err(|_| Error::BadSignature(role.clone()))?;
+                &ec_point
+            }
+            _ => &self.value.0,
+        };
+
+        let key = ring::signature::UnparsedPublicKey::new(alg, key_bytes);
         key.verify(msg, &sig.value.0)
             .map_err(|_| Error::BadSignature(role.clone()))
     }
+}
+
+/// PEM SPKI (NIST P-256) → raw uncompressed EC point (`0x04 || X || Y`).
+fn ec_point_from_pem_spki(pem: &[u8]) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(pem)
+        .map_err(|err| Error::Encoding(format!("ECDSA PEM was not valid UTF-8: {err:?}")))?;
+
+    let start = text
+        .find("-----BEGIN PUBLIC KEY-----")
+        .ok_or_else(|| Error::Encoding("ECDSA PEM missing BEGIN PUBLIC KEY marker".into()))?;
+    let after_begin = start + "-----BEGIN PUBLIC KEY-----".len();
+    let end = text[after_begin..]
+        .find("-----END PUBLIC KEY-----")
+        .ok_or_else(|| Error::Encoding("ECDSA PEM missing END PUBLIC KEY marker".into()))?;
+    let body = &text[after_begin..after_begin + end];
+
+    let der = BASE64_MIME
+        .decode(body.as_bytes())
+        .map_err(|err| Error::Encoding(format!("ECDSA PEM body was not valid base64: {err:?}")))?;
+
+    let input = Input::from(&der);
+    let point = input
+        .read_all(derp::Error::Read, |input| {
+            derp::nested(input, Tag::Sequence, |input| {
+                derp::nested(input, Tag::Sequence, |input| {
+                    let alg = derp::expect_tag_and_get_value(input, Tag::Oid)?;
+                    if alg.as_slice_less_safe() != EC_PUBLIC_KEY_OID {
+                        return Err(derp::Error::WrongValue);
+                    }
+                    let curve = derp::expect_tag_and_get_value(input, Tag::Oid)?;
+                    if curve.as_slice_less_safe() != P256_OID {
+                        return Err(derp::Error::WrongValue);
+                    }
+                    Ok(())
+                })?;
+                let bits = derp::bit_string_with_no_unused_bits(input)?;
+                Ok(bits.as_slice_less_safe().to_vec())
+            })
+        })
+        .map_err(derp_error_to_error)?;
+
+    Ok(point)
 }
 
 impl PartialEq for PublicKey {
@@ -931,6 +1013,28 @@ impl<'de> Deserialize<'de> for PublicKey {
                 )
                 .map_err(|e| {
                     DeserializeError::custom(format!("Couldn't parse key as SPKI: {:?}", e))
+                })?
+            }
+            KeyType::Ecdsa => {
+                if intermediate.scheme() != &SignatureScheme::EcdsaSha2Nistp256 {
+                    return Err(DeserializeError::custom(format!(
+                        "ecdsa key type must be paired with ecdsa-sha2-nistp256, not {:?}",
+                        intermediate.scheme()
+                    )));
+                }
+                // Validate the PEM parses as P-256 SPKI; store the bytes verbatim for keyid.
+                let pem_bytes = intermediate.public_key().as_bytes().to_vec();
+                ec_point_from_pem_spki(&pem_bytes).map_err(|e| {
+                    DeserializeError::custom(format!("Couldn't parse ECDSA P-256 key: {e:?}"))
+                })?;
+                PublicKey::new(
+                    KeyType::Ecdsa,
+                    SignatureScheme::EcdsaSha2Nistp256,
+                    intermediate.keyid_hash_algorithms().clone(),
+                    pem_bytes,
+                )
+                .map_err(|e| {
+                    DeserializeError::custom(format!("Couldn't construct ECDSA PublicKey: {e:?}"))
                 })?
             }
             KeyType::Unknown(_) => {
@@ -1152,6 +1256,14 @@ mod test {
         pub(super) const PK8_1: &[u8] = include_bytes!("../tests/ed25519/ed25519-1.pk8.der");
         pub(super) const SPKI_1: &[u8] = include_bytes!("../tests/ed25519/ed25519-1.spki.der");
         pub(super) const PK8_2: &[u8] = include_bytes!("../tests/ed25519/ed25519-2.pk8.der");
+    }
+
+    mod ecdsa {
+        // Synthetic 2-of-2 ECDSA P-256-signed root. `.canonical` is the OLPC-canonical signed
+        // body the signatures cover.
+        pub(super) const ECDSA_ROOT: &[u8] = include_bytes!("../tests/ecdsa/ecdsa_root.json");
+        pub(super) const ECDSA_ROOT_CANONICAL: &[u8] =
+            include_bytes!("../tests/ecdsa/ecdsa_root.canonical");
     }
 
     #[cfg(feature = "unstable_rsa")]
@@ -1690,5 +1802,94 @@ mod test {
         let key2 = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2).unwrap();
 
         check_public_key_hash(key1.public(), key2.public());
+    }
+
+    /// Recomputed ECDSA keyids must match the stamped keyids in the root.
+    #[test]
+    fn deserialize_ecdsa_keys_keyids_match() {
+        let root: serde_json::Value = serde_json::from_slice(ecdsa::ECDSA_ROOT).unwrap();
+        let signed_keys = root["signed"]["keys"].as_object().unwrap();
+        let stamped_keyids: Vec<String> = root["signed"]["roles"]["root"]["keyids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+
+        for (expected_keyid, key_json) in signed_keys {
+            let key: PublicKey = serde_json::from_value(key_json.clone()).unwrap();
+            assert_eq!(key.typ(), &KeyType::Ecdsa);
+            assert_eq!(key.scheme(), &SignatureScheme::EcdsaSha2Nistp256);
+            assert_eq!(
+                key.key_id().0,
+                *expected_keyid,
+                "recomputed keyid {} does not match stamped keyid {}",
+                key.key_id().0,
+                expected_keyid
+            );
+            assert!(stamped_keyids.contains(expected_keyid));
+        }
+    }
+
+    /// Each ECDSA signature on the test root must verify against its declared key.
+    #[test]
+    fn verify_ecdsa_signatures_against_canonical_signed_body() {
+        let root: serde_json::Value = serde_json::from_slice(ecdsa::ECDSA_ROOT).unwrap();
+        let signed_keys = root["signed"]["keys"].as_object().unwrap();
+        let signatures = root["signatures"].as_array().unwrap();
+        let role = MetadataPath::root();
+        let msg = ecdsa::ECDSA_ROOT_CANONICAL;
+        assert!(!signatures.is_empty(), "test root must have signatures");
+
+        for sig_json in signatures {
+            let sig: Signature = serde_json::from_value(sig_json.clone()).unwrap();
+            let key_id_str = &sig.key_id().0;
+            let key_json = signed_keys
+                .get(key_id_str)
+                .unwrap_or_else(|| panic!("key {} not present in keys map", key_id_str));
+            let key: PublicKey = serde_json::from_value(key_json.clone()).unwrap();
+            key.verify(&role, msg, &sig).unwrap_or_else(|e| {
+                panic!("ECDSA signature {} did not verify: {:?}", key_id_str, e)
+            });
+        }
+    }
+
+    #[test]
+    fn ecdsa_signature_scheme_aliases() {
+        assert_eq!(
+            SignatureScheme::new("ecdsa-sha2-nistp256"),
+            SignatureScheme::EcdsaSha2Nistp256
+        );
+        assert_eq!(
+            SignatureScheme::new("ecdsa"),
+            SignatureScheme::EcdsaSha2Nistp256
+        );
+        assert_eq!(
+            SignatureScheme::EcdsaSha2Nistp256.as_str(),
+            "ecdsa-sha2-nistp256"
+        );
+    }
+
+    /// A bit-flipped signature must fail verification.
+    #[test]
+    fn verify_ecdsa_rejects_corrupted_signature() {
+        let root: serde_json::Value = serde_json::from_slice(ecdsa::ECDSA_ROOT).unwrap();
+        let signed_keys = root["signed"]["keys"].as_object().unwrap();
+        let sig_json = root["signatures"][0].clone();
+        let sig: Signature = serde_json::from_value(sig_json).unwrap();
+        let key_json = signed_keys.get(&sig.key_id().0).unwrap().clone();
+        let key: PublicKey = serde_json::from_value(key_json).unwrap();
+
+        let mut bad_value = sig.value().0.clone();
+        if let Some(last) = bad_value.last_mut() {
+            *last ^= 0x01;
+        }
+        let bad_sig = Signature {
+            key_id: sig.key_id().clone(),
+            value: SignatureValue(bad_value),
+        };
+
+        let result = key.verify(&MetadataPath::root(), ecdsa::ECDSA_ROOT_CANONICAL, &bad_sig);
+        assert_matches!(result, Err(Error::BadSignature(_)));
     }
 }
