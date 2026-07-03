@@ -609,7 +609,7 @@ where
     {
         let next_version = if let Some(db) = self.ctx.db {
             db.trusted_root().version().checked_add(1).ok_or_else(|| {
-                Error::MetadataVersionMustBeSmallerThanMaxU32(MetadataPath::root())
+                Error::MetadataVersionMustBeSmallerThanMaxU64(MetadataPath::root())
             })?
         } else {
             1
@@ -1516,7 +1516,7 @@ mod tests {
     }
 
     fn create_root(
-        version: u32,
+        version: u64,
         consistent_snapshot: bool,
         expires: DateTime<Utc>,
     ) -> SignedMetadata<Json, RootMetadata> {
@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     fn create_targets(
-        version: u32,
+        version: u64,
         expires: DateTime<Utc>,
     ) -> SignedMetadata<Json, TargetsMetadata> {
         let targets = TargetsMetadataBuilder::new()
@@ -1575,7 +1575,7 @@ mod tests {
     }
 
     fn create_snapshot(
-        version: u32,
+        version: u64,
         expires: DateTime<Utc>,
         targets: &SignedMetadata<Json, TargetsMetadata>,
         include_length_and_hashes: bool,
@@ -1611,7 +1611,7 @@ mod tests {
     }
 
     fn create_timestamp(
-        version: u32,
+        version: u64,
         expires: DateTime<Utc>,
         snapshot: &SignedMetadata<Json, SnapshotMetadata>,
         include_length_and_hashes: bool,

@@ -106,7 +106,7 @@ async fn update_root(
     repo: &mut FileSystemRepository<JsonPretty>,
     keys: &RoleKeys,
     root_signer: Option<&dyn PrivateKey>,
-    version: u32,
+    version: u64,
     consistent_snapshot: bool,
 ) {
     // Same expiration as go-tuf metadata generator.
@@ -148,7 +148,7 @@ async fn add_target(
 ) {
     // Same expiration as go-tuf metadata generator.
     let expiration = Utc.ymd(2100, 1, 1).and_hms(0, 0, 0);
-    let version: u32 = (step + 1).into();
+    let version: u64 = (step + 1).into();
 
     let mut targets_builder = TargetsMetadataBuilder::new()
         .expires(expiration)

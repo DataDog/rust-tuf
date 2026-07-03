@@ -41,7 +41,7 @@ pub struct RootMetadata {
     #[serde(rename = "_type")]
     typ: metadata::Role,
     spec_version: String,
-    version: u32,
+    version: u64,
     consistent_snapshot: bool,
     expires: String,
     #[serde(deserialize_with = "deserialize_reject_duplicates::deserialize")]
@@ -164,7 +164,7 @@ pub struct TimestampMetadata {
     #[serde(rename = "_type")]
     typ: metadata::Role,
     spec_version: String,
-    version: u32,
+    version: u64,
     expires: String,
     meta: TimestampMeta,
     #[serde(flatten)]
@@ -221,7 +221,7 @@ pub struct SnapshotMetadata {
     #[serde(rename = "_type")]
     typ: metadata::Role,
     spec_version: String,
-    version: u32,
+    version: u64,
     expires: String,
     #[serde(deserialize_with = "deserialize_reject_duplicates::deserialize")]
     meta: BTreeMap<String, metadata::MetadataDescription>,
@@ -289,7 +289,7 @@ pub struct TargetsMetadata {
     #[serde(rename = "_type")]
     typ: metadata::Role,
     spec_version: String,
-    version: u32,
+    version: u64,
     expires: String,
     targets: BTreeMap<metadata::TargetPath, metadata::TargetDescription>,
     #[serde(default, skip_serializing_if = "metadata::Delegations::is_empty")]
@@ -534,7 +534,7 @@ impl TargetDescription {
 
 #[derive(Deserialize)]
 pub struct MetadataDescription {
-    version: u32,
+    version: u64,
     #[serde(default)]
     length: Option<usize>,
     #[serde(default)]
