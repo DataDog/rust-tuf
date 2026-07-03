@@ -212,7 +212,7 @@ pub enum MetadataVersion {
     /// The metadata is unversioned. This is the latest version of the metadata.
     None,
     /// The metadata is addressed by a specific version number.
-    Number(u32),
+    Number(u64),
 }
 
 impl Display for MetadataVersion {
@@ -240,7 +240,7 @@ pub trait Metadata: Debug + PartialEq + Serialize + DeserializeOwned {
     const ROLE: Role;
 
     /// The version number.
-    fn version(&self) -> u32;
+    fn version(&self) -> u64;
 
     /// An immutable reference to the metadata's expiration `DateTime`.
     fn expires(&self) -> &DateTime<Utc>;
@@ -575,10 +575,10 @@ where
     /// This operation is generally unsafe to do with metadata obtained from an untrusted source,
     /// but rolling forward to the most recent root.json requires using the version number of the
     /// latest root.json.
-    pub(crate) fn parse_version_untrusted(&self) -> Result<u32> {
+    pub(crate) fn parse_version_untrusted(&self) -> Result<u64> {
         #[derive(Deserialize)]
         pub struct MetadataVersion {
-            version: u32,
+            version: u64,
         }
 
         let meta: MetadataVersion = D::deserialize(&self.metadata)?;
@@ -595,7 +595,7 @@ where
 
 /// Helper to construct `RootMetadata`.
 pub struct RootMetadataBuilder {
-    version: u32,
+    version: u64,
     expires: DateTime<Utc>,
     consistent_snapshot: bool,
     keys: HashMap<KeyId, PublicKey>,
@@ -634,7 +634,7 @@ impl RootMetadataBuilder {
     }
 
     /// Set the version number for this metadata.
-    pub fn version(mut self, version: u32) -> Self {
+    pub fn version(mut self, version: u64) -> Self {
         self.version = version;
         self
     }
@@ -759,7 +759,7 @@ impl From<RootMetadata> for RootMetadataBuilder {
 /// Metadata for the root role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootMetadata {
-    version: u32,
+    version: u64,
     expires: DateTime<Utc>,
     consistent_snapshot: bool,
     keys: HashMap<KeyId, PublicKey>,
@@ -773,7 +773,7 @@ pub struct RootMetadata {
 impl RootMetadata {
     /// Create new `RootMetadata`.
     pub fn new(
-        version: u32,
+        version: u64,
         expires: DateTime<Utc>,
         consistent_snapshot: bool,
         keys: HashMap<KeyId, PublicKey>,
@@ -875,7 +875,7 @@ impl RootMetadata {
 impl Metadata for RootMetadata {
     const ROLE: Role = Role::Root;
 
-    fn version(&self) -> u32 {
+    fn version(&self) -> u64 {
         self.version
     }
 
@@ -1082,7 +1082,7 @@ impl<'de> Deserialize<'de> for MetadataPath {
 
 /// Helper to construct `TimestampMetadata`.
 pub struct TimestampMetadataBuilder {
-    version: u32,
+    version: u64,
     expires: DateTime<Utc>,
     snapshot: MetadataDescription,
 }
@@ -1123,7 +1123,7 @@ impl TimestampMetadataBuilder {
     }
 
     /// Set the version number for this metadata.
-    pub fn version(mut self, version: u32) -> Self {
+    pub fn version(mut self, version: u64) -> Self {
         self.version = version;
         self
     }
@@ -1159,7 +1159,7 @@ impl TimestampMetadataBuilder {
 /// Metadata for the timestamp role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimestampMetadata {
-    version: u32,
+    version: u64,
     expires: DateTime<Utc>,
     snapshot: MetadataDescription,
     additional_fields: HashMap<String, serde_json::Value>,
@@ -1168,7 +1168,7 @@ pub struct TimestampMetadata {
 impl TimestampMetadata {
     /// Create new `TimestampMetadata`.
     pub fn new(
-        version: u32,
+        version: u64,
         expires: DateTime<Utc>,
         snapshot: MetadataDescription,
         additional_fields: HashMap<String, serde_json::Value>,
@@ -1202,7 +1202,7 @@ impl TimestampMetadata {
 impl Metadata for TimestampMetadata {
     const ROLE: Role = Role::Timestamp;
 
-    fn version(&self) -> u32 {
+    fn version(&self) -> u64 {
         self.version
     }
 
@@ -1234,7 +1234,7 @@ impl<'de> Deserialize<'de> for TimestampMetadata {
 /// Description of a piece of metadata, used in verification.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MetadataDescription {
-    version: u32,
+    version: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     length: Option<usize>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -1243,7 +1243,7 @@ pub struct MetadataDescription {
 
 impl MetadataDescription {
     /// Create a `MetadataDescription` from a slice. Size and hashes will be calculated.
-    pub fn from_slice(buf: &[u8], version: u32, hash_algs: &[HashAlgorithm]) -> Result<Self> {
+    pub fn from_slice(buf: &[u8], version: u64, hash_algs: &[HashAlgorithm]) -> Result<Self> {
         if version < 1 {
             return Err(Error::IllegalArgument(
                 "Version must be greater than zero".into(),
@@ -1265,7 +1265,7 @@ impl MetadataDescription {
 
     /// Create a new `MetadataDescription`.
     pub fn new(
-        version: u32,
+        version: u64,
         length: Option<usize>,
         hashes: HashMap<HashAlgorithm, HashValue>,
     ) -> Result<Self> {
@@ -1284,7 +1284,7 @@ impl MetadataDescription {
     }
 
     /// The version of the described metadata.
-    pub fn version(&self) -> u32 {
+    pub fn version(&self) -> u64 {
         self.version
     }
 
@@ -1310,7 +1310,7 @@ impl<'de> Deserialize<'de> for MetadataDescription {
 
 /// Helper to construct `SnapshotMetadata`.
 pub struct SnapshotMetadataBuilder {
-    version: u32,
+    version: u64,
     expires: DateTime<Utc>,
     meta: HashMap<MetadataPath, MetadataDescription>,
 }
@@ -1343,7 +1343,7 @@ impl SnapshotMetadataBuilder {
     }
 
     /// Set the version number for this metadata.
-    pub fn version(mut self, version: u32) -> Self {
+    pub fn version(mut self, version: u64) -> Self {
         self.version = version;
         self
     }
@@ -1435,7 +1435,7 @@ impl From<SnapshotMetadata> for SnapshotMetadataBuilder {
 /// Metadata for the snapshot role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotMetadata {
-    version: u32,
+    version: u64,
     expires: DateTime<Utc>,
     meta: HashMap<MetadataPath, MetadataDescription>,
     additional_fields: HashMap<String, serde_json::Value>,
@@ -1444,7 +1444,7 @@ pub struct SnapshotMetadata {
 impl SnapshotMetadata {
     /// Create new `SnapshotMetadata`.
     pub fn new(
-        version: u32,
+        version: u64,
         expires: DateTime<Utc>,
         meta: HashMap<MetadataPath, MetadataDescription>,
         additional_fields: HashMap<String, serde_json::Value>,
@@ -1478,7 +1478,7 @@ impl SnapshotMetadata {
 impl Metadata for SnapshotMetadata {
     const ROLE: Role = Role::Snapshot;
 
-    fn version(&self) -> u32 {
+    fn version(&self) -> u64 {
         self.version
     }
 
@@ -1867,7 +1867,7 @@ impl<'de> Deserialize<'de> for TargetDescription {
 /// Metadata for the targets role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetsMetadata {
-    version: u32,
+    version: u64,
     expires: DateTime<Utc>,
     targets: HashMap<TargetPath, TargetDescription>,
     delegations: Delegations,
@@ -1877,7 +1877,7 @@ pub struct TargetsMetadata {
 impl TargetsMetadata {
     /// Create new `TargetsMetadata`.
     pub fn new(
-        version: u32,
+        version: u64,
         expires: DateTime<Utc>,
         targets: HashMap<TargetPath, TargetDescription>,
         delegations: Delegations,
@@ -1918,7 +1918,7 @@ impl TargetsMetadata {
 impl Metadata for TargetsMetadata {
     const ROLE: Role = Role::Targets;
 
-    fn version(&self) -> u32 {
+    fn version(&self) -> u64 {
         self.version
     }
 
@@ -1949,7 +1949,7 @@ impl<'de> Deserialize<'de> for TargetsMetadata {
 
 /// Helper to construct `TargetsMetadata`.
 pub struct TargetsMetadataBuilder {
-    version: u32,
+    version: u64,
     expires: DateTime<Utc>,
     targets: HashMap<TargetPath, TargetDescription>,
     delegations: Option<Delegations>,
@@ -1970,7 +1970,7 @@ impl TargetsMetadataBuilder {
     }
 
     /// Set the version number for this metadata.
-    pub fn version(mut self, version: u32) -> Self {
+    pub fn version(mut self, version: u64) -> Self {
         self.version = version;
         self
     }
@@ -3657,6 +3657,64 @@ mod test {
         let mut targets = make_targets();
         set_version(&mut targets, -1);
         assert!(serde_json::from_value::<TargetsMetadata>(targets).is_err());
+    }
+
+    // Accept targets metadata with a version that does not fit in a u32.
+    #[test]
+    fn deserialize_json_targets_u64_version() {
+        let big_version: u64 = u32::MAX as u64 + 1;
+
+        let mut targets = make_targets();
+        targets
+            .as_object_mut()
+            .unwrap()
+            .insert("version".into(), json!(big_version));
+
+        let decoded: TargetsMetadata = serde_json::from_value(targets.clone()).unwrap();
+        assert_eq!(decoded.version(), big_version);
+
+        // Round-tripping preserves the large version.
+        let reencoded = serde_json::to_value(&decoded).unwrap();
+        assert_eq!(reencoded, targets);
+    }
+
+    // Accept targets metadata with the maximum u64 version.
+    #[test]
+    fn deserialize_json_targets_u64_max_version() {
+        let mut targets = make_targets();
+        targets
+            .as_object_mut()
+            .unwrap()
+            .insert("version".into(), json!(u64::MAX));
+
+        let decoded: TargetsMetadata = serde_json::from_value(targets).unwrap();
+        assert_eq!(decoded.version(), u64::MAX);
+    }
+
+    // Accept snapshot metadata whose meta descriptions reference targets
+    // versions that do not fit in a u32.
+    #[test]
+    fn deserialize_json_snapshot_meta_u64_version() {
+        let big_version: u64 = u32::MAX as u64 + 42;
+
+        let snapshot_json = json!({
+            "_type": "snapshot",
+            "spec_version": "1.0.0",
+            "version": 1u64,
+            "expires": "2038-01-01T00:00:00Z",
+            "meta": {
+                "targets.json": {
+                    "version": big_version,
+                }
+            }
+        });
+
+        let decoded: SnapshotMetadata = serde_json::from_value(snapshot_json).unwrap();
+        let description = decoded
+            .meta()
+            .get(&MetadataPath::targets())
+            .expect("targets description");
+        assert_eq!(description.version(), big_version);
     }
 
     // Refuse to deserialize targets metadata with wrong type field

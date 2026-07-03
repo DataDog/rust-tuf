@@ -115,9 +115,9 @@ pub enum Error {
     #[error("metadata {0} threshold must be greater than zero")]
     MetadataThresholdMustBeGreaterThanZero(MetadataPath),
 
-    /// The metadata's version must be less than `u32::MAX`.
-    #[error("metadata {0} version should be less than max u32")]
-    MetadataVersionMustBeSmallerThanMaxU32(MetadataPath),
+    /// The metadata's version must be less than `u64::MAX`.
+    #[error("metadata {0} version should be less than max u64")]
+    MetadataVersionMustBeSmallerThanMaxU64(MetadataPath),
 
     /// The metadata was not signed with enough valid signatures.
     #[error(
@@ -140,9 +140,9 @@ pub enum Error {
         /// The metadata.
         role: MetadataPath,
         /// The trusted metadata's version.
-        trusted_version: u32,
+        trusted_version: u64,
         /// The new metadata's version.
-        new_version: u32,
+        new_version: u64,
     },
 
     /// The parent metadata expected the child metadata to be at one version, but was found to be at
@@ -154,9 +154,9 @@ pub enum Error {
         /// The child metadata that has an unexpected version.
         child_role: MetadataPath,
         /// The expected version of the child metadata.
-        expected_version: u32,
+        expected_version: u64,
         /// The actual version of the child metadata.
-        new_version: u32,
+        new_version: u64,
     },
 
     /// The parent metadata does not contain a description of the child metadata.

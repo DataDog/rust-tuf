@@ -306,7 +306,7 @@ impl<D: DataInterchange> Database<D> {
             //     update cycle, begin at step 0 and version N of the root metadata file.
 
             let next_root_version = trusted_root.version().checked_add(1).ok_or_else(|| {
-                Error::MetadataVersionMustBeSmallerThanMaxU32(MetadataPath::root())
+                Error::MetadataVersionMustBeSmallerThanMaxU64(MetadataPath::root())
             })?;
 
             if new_root.version() != next_root_version {
@@ -722,7 +722,7 @@ impl<D: DataInterchange> Database<D> {
         raw_targets: &RawSignedMetadata<D, TargetsMetadata>,
         trusted_targets_threshold: u32,
         trusted_targets_keys: impl Iterator<Item = &'a PublicKey>,
-        trusted_targets_version: Option<u32>,
+        trusted_targets_version: Option<u64>,
     ) -> Result<Option<Verified<TargetsMetadata>>> {
         // FIXME(https://github.com/theupdateframework/specification/issues/113) Checking if
         // this metadata expired isn't part of the spec. Do we actually want to do this?
