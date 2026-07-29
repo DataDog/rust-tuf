@@ -463,6 +463,20 @@ where
         &mut self.tuf
     }
 
+    /// Clear all trusted non-root metadata (snapshot, targets, timestamp, and
+    /// delegated targets) on the underlying [`Database`] while preserving the
+    /// currently trusted root (including any version reached via root chaining).
+    ///
+    /// Callers can use this to recover from a mid-update failure without
+    /// discarding a trusted root that has already been walked forward past its
+    /// bundled/embedded starting version. See [`Database::purge_metadata`] for
+    /// details. Local and remote repository caches held by this [`Client`] are
+    /// not affected; reset them via [`Client::local_repo_mut`] /
+    /// [`Client::remote_repo_mut`] if desired.
+    pub fn purge_metadata(&mut self) {
+        self.tuf.purge_metadata();
+    }
+
     /// Returns a refrerence to the local repository.
     pub fn local_repo(&self) -> &L {
         self.local.as_inner()

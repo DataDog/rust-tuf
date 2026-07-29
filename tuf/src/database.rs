@@ -977,7 +977,20 @@ impl<D: DataInterchange> Database<D> {
         }
     }
 
-    fn purge_metadata(&mut self) {
+    /// Clear all trusted non-root metadata (snapshot, targets, timestamp, and
+    /// delegated targets) while preserving the currently trusted root — including
+    /// any newer root version reached via [`Database::update_root`] chaining.
+    ///
+    /// This is the same operation performed internally after a successful root
+    /// rotation per TUF-1.0.5 §5.1.9 to recover from fast-forward attacks. It is
+    /// exposed so callers can drop potentially-poisoned derived metadata (e.g.
+    /// after a mid-update failure) without discarding the advanced trusted root
+    /// and being forced to restart chaining from an embedded/bundled root.
+    ///
+    /// Only in-memory verified state on the [`Database`] is affected; any local
+    /// or remote repository caches held by a [`crate::client::Client`] are not
+    /// touched by this method.
+    pub fn purge_metadata(&mut self) {
         self.trusted_snapshot = None;
         self.trusted_targets = None;
         self.trusted_timestamp = None;
@@ -1659,6 +1672,147 @@ mod test {
             .build();
 
         assert_matches!(tuf.update_metadata(&metadata2), Ok(true));
+    }
+
+    #[test]
+    fn test_purge_metadata_preserves_trusted_root() {
+        // Build v1 metadata and load it as trusted.
+        let raw_root1 = RootMetadataBuilder::new()
+            .root_key(KEYS[0].public().clone())
+            .targets_key(KEYS[1].public().clone())
+            .snapshot_key(KEYS[2].public().clone())
+            .timestamp_key(KEYS[3].public().clone())
+            .signed::<Json>(&KEYS[0])
+            .unwrap()
+            .to_raw()
+            .unwrap();
+
+        let signed_targets1 = TargetsMetadataBuilder::new()
+            .signed::<Json>(&KEYS[1])
+            .unwrap();
+        let raw_targets1 = signed_targets1.to_raw().unwrap();
+
+        let snapshot1 = SnapshotMetadataBuilder::new()
+            .insert_metadata(&signed_targets1, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Json>(&KEYS[2])
+            .unwrap();
+        let raw_snapshot1 = snapshot1.to_raw().unwrap();
+
+        let raw_timestamp1 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot1, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .signed::<Json>(&KEYS[3])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        let metadata1 = RawSignedMetadataSetBuilder::new()
+            .root(raw_root1)
+            .targets(raw_targets1)
+            .snapshot(raw_snapshot1)
+            .timestamp(raw_timestamp1)
+            .build();
+
+        let mut tuf = Database::from_trusted_metadata(&metadata1).unwrap();
+
+        // Rotate to root v2 via update_metadata so trusted_root is advanced
+        // through the chained-rotation code path (not just replaced by TOFU).
+        let raw_root2 = RootMetadataBuilder::new()
+            .version(2)
+            .root_key(KEYS[0].public().clone())
+            .targets_key(KEYS[1].public().clone())
+            .snapshot_key(KEYS[2].public().clone())
+            .timestamp_key(KEYS[3].public().clone())
+            .signed::<Json>(&KEYS[0])
+            .unwrap()
+            .to_raw()
+            .unwrap();
+
+        let signed_targets2 = TargetsMetadataBuilder::new()
+            .version(2)
+            .signed::<Json>(&KEYS[1])
+            .unwrap();
+        let raw_targets2 = signed_targets2.to_raw().unwrap();
+
+        let snapshot2 = SnapshotMetadataBuilder::new()
+            .version(2)
+            .insert_metadata(&signed_targets2, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Json>(&KEYS[2])
+            .unwrap();
+        let raw_snapshot2 = snapshot2.to_raw().unwrap();
+
+        let raw_timestamp2 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot2, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(2)
+                .signed::<Json>(&KEYS[3])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        let metadata2 = RawSignedMetadataSetBuilder::new()
+            .root(raw_root2)
+            .targets(raw_targets2)
+            .snapshot(raw_snapshot2)
+            .timestamp(raw_timestamp2)
+            .build();
+
+        assert_matches!(tuf.update_metadata(&metadata2), Ok(true));
+
+        // Sanity: everything is populated and root is at v2.
+        assert_eq!(tuf.trusted_root().version(), 2);
+        assert!(tuf.trusted_snapshot().is_some());
+        assert!(tuf.trusted_targets().is_some());
+        assert!(tuf.trusted_timestamp().is_some());
+
+        // Purge: root stays at v2, derived metadata is cleared.
+        tuf.purge_metadata();
+
+        assert_eq!(tuf.trusted_root().version(), 2);
+        assert!(tuf.trusted_snapshot().is_none());
+        assert!(tuf.trusted_targets().is_none());
+        assert!(tuf.trusted_timestamp().is_none());
+        assert!(tuf.trusted_delegations().is_empty());
+
+        // A subsequent update must succeed against the retained trusted root:
+        // resubmit v2 timestamp/snapshot/targets without the root (which would
+        // otherwise be rejected as a rollback since we're already at v2).
+        let signed_targets2_replay = TargetsMetadataBuilder::new()
+            .version(2)
+            .signed::<Json>(&KEYS[1])
+            .unwrap();
+        let raw_targets2_replay = signed_targets2_replay.to_raw().unwrap();
+
+        let snapshot2_replay = SnapshotMetadataBuilder::new()
+            .version(2)
+            .insert_metadata(&signed_targets2_replay, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Json>(&KEYS[2])
+            .unwrap();
+        let raw_snapshot2_replay = snapshot2_replay.to_raw().unwrap();
+
+        let raw_timestamp2_replay =
+            TimestampMetadataBuilder::from_snapshot(&snapshot2_replay, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(2)
+                .signed::<Json>(&KEYS[3])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        let metadata2_replay = RawSignedMetadataSetBuilder::new()
+            .targets(raw_targets2_replay)
+            .snapshot(raw_snapshot2_replay)
+            .timestamp(raw_timestamp2_replay)
+            .build();
+
+        assert_matches!(tuf.update_metadata(&metadata2_replay), Ok(true));
+        assert_eq!(tuf.trusted_root().version(), 2);
+        assert!(tuf.trusted_snapshot().is_some());
+        assert!(tuf.trusted_targets().is_some());
+        assert!(tuf.trusted_timestamp().is_some());
     }
 
     #[test]

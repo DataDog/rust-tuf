@@ -845,7 +845,7 @@ where
 
         if let Some(trusted_targets) = self.ctx.db.and_then(|db| db.trusted_targets()) {
             let next_version = trusted_targets.version().checked_add(1).ok_or_else(|| {
-                Error::MetadataVersionMustBeSmallerThanMaxU32(MetadataPath::targets())
+                Error::MetadataVersionMustBeSmallerThanMaxU64(MetadataPath::targets())
             })?;
 
             targets_builder = targets_builder.version(next_version);
@@ -1036,7 +1036,7 @@ where
 
         if let Some(trusted_snapshot) = self.ctx.db.and_then(|db| db.trusted_snapshot()) {
             let next_version = trusted_snapshot.version().checked_add(1).ok_or_else(|| {
-                Error::MetadataVersionMustBeSmallerThanMaxU32(MetadataPath::snapshot())
+                Error::MetadataVersionMustBeSmallerThanMaxU64(MetadataPath::snapshot())
             })?;
 
             snapshot_builder = snapshot_builder.version(next_version);
@@ -1201,7 +1201,7 @@ where
         let next_version = if let Some(db) = self.ctx.db {
             if let Some(trusted_timestamp) = db.trusted_timestamp() {
                 trusted_timestamp.version().checked_add(1).ok_or_else(|| {
-                    Error::MetadataVersionMustBeSmallerThanMaxU32(MetadataPath::timestamp())
+                    Error::MetadataVersionMustBeSmallerThanMaxU64(MetadataPath::timestamp())
                 })?
             } else {
                 1
