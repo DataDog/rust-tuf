@@ -46,6 +46,19 @@ where
     pub(crate) fn metadata(&self) -> &HashMap<(MetadataPath, MetadataVersion), Box<[u8]>> {
         &self.metadata
     }
+
+    /// Synchronously fetch the raw bytes of a stored target, without going
+    /// through the async [`RepositoryProvider`] trait.
+    ///
+    /// Since an [`EphemeralRepository`] is fully in-memory, no I/O is required
+    /// to read the target and no async runtime is needed. Returns
+    /// [`Error::TargetNotFound`] if the target has not been stored.
+    pub fn get_target(&self, target_path: &TargetPath) -> Result<&[u8]> {
+        self.targets
+            .get(target_path)
+            .map(|b| &**b)
+            .ok_or_else(|| Error::TargetNotFound(target_path.clone()))
+    }
 }
 
 impl<D> RepositoryProvider<D> for EphemeralRepository<D>
@@ -134,6 +147,19 @@ impl<'a, D> EphemeralBatchUpdate<'a, D>
 where
     D: DataInterchange + Sync,
 {
+    /// Synchronously fetch the raw bytes of a stored target, without going
+    /// through the async [`RepositoryProvider`] trait.
+    ///
+    /// The staged (uncommitted) targets shadow the parent's targets, matching
+    /// the behavior of [`RepositoryProvider::fetch_target`].
+    pub fn get_target(&self, target_path: &TargetPath) -> Result<&[u8]> {
+        if let Some(bytes) = self.staging_repo.targets.get(target_path) {
+            Ok(&**bytes)
+        } else {
+            self.parent_repo.get_target(target_path)
+        }
+    }
+
     /// Write all the metadata and targets in the [EphemeralBatchUpdate] to the source
     /// [EphemeralRepository] in a single batch operation.
     pub fn commit(self) {
@@ -256,6 +282,43 @@ mod test {
             buf.clear();
             read.read_to_end(&mut buf).await.unwrap();
             assert_eq!(buf.as_slice(), bad_data);
+        })
+    }
+
+    #[test]
+    fn ephemeral_repo_get_target_sync() {
+        block_on(async {
+            let mut repo = EphemeralRepository::<Json>::new();
+            let path = TargetPath::new("sync-target").unwrap();
+
+            // Missing target returns TargetNotFound.
+            assert_matches!(
+                repo.get_target(&path),
+                Err(Error::TargetNotFound(p)) if p == path
+            );
+
+            // After storing, we can read the bytes back synchronously.
+            let data: &[u8] = b"in-memory bytes";
+            repo.store_target(&path, &mut &*data).await.unwrap();
+            assert_eq!(repo.get_target(&path).unwrap(), data);
+
+            // Batch update: staged bytes shadow the parent's bytes, and the
+            // parent's bytes remain visible for un-staged targets.
+            let other_path = TargetPath::new("other").unwrap();
+            let other_data: &[u8] = b"parent only";
+            repo.store_target(&other_path, &mut &*other_data)
+                .await
+                .unwrap();
+
+            let mut batch = repo.batch_update();
+            let staged: &[u8] = b"staged bytes";
+            batch.store_target(&path, &mut &*staged).await.unwrap();
+            assert_eq!(batch.get_target(&path).unwrap(), staged);
+            assert_eq!(batch.get_target(&other_path).unwrap(), other_data);
+
+            // Dropping the batch without committing leaves the parent unchanged.
+            drop(batch);
+            assert_eq!(repo.get_target(&path).unwrap(), data);
         })
     }
 
