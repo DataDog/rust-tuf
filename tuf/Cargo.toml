@@ -49,6 +49,8 @@ serde_json = { version = "1", features = ["preserve_order"] }
 [features]
 default = ["hyper", "hyper/tcp"]
 
+wasm32_unknown_unknown_js = ["ring/wasm32_unknown_unknown_js"]
+
 # FIXME(https://github.com/theupdateframework/rust-tuf/issues/329) - RSA key
 # support does not yet conform to the TUF spec, so it is disabled by default.
 # As a warning it may experience breaking changes without a major version bump.
