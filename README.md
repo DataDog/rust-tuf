@@ -1,3 +1,8 @@
+> ⚠️ **This is a vendored fork of [theupdateframework/rust-tuf](https://github.com/theupdateframework/rust-tuf).**
+>
+> It is published under the name `libdd-tuf` to allow libdatadog to be released on
+> crates.io without git dependencies. **Do not use this crate directly**
+
 # rust-tuf
 
 A Rust implementation of [The Update Framework (TUF)](https://theupdateframework.github.io/).
