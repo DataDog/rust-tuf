@@ -1,7 +1,8 @@
 [package]
 name = "libdd-tuf"
 edition = "2021"
-version = "0.3.1"
+version = "0.3.2"
+rust-version = "1.87.0"
 authors = [ "heartsucker <heartsucker@autistici.org>", "Erick Tryzelaar <etryzelaar@google.com>" ]
 description = "Library for The Update Framework (TUF)"
 homepage = "https://github.com/theupdateframework/rust-tuf"
@@ -19,12 +20,12 @@ path = "./src/lib.rs"
 [dependencies]
 chrono = { version = "0.4", features = [ "serde" ] }
 data-encoding = "2.0.0-rc.2"
-derp = "0.0.14"
+derp = "0.0.15"
 futures-io = "0.3.1"
 futures-util = { version = "0.3.1", features = [ "io" ] }
-http = "0.2.0"
+http = { version = "0.2.0", optional = true }
 hyper = { version = "0.14.15", default-features = false, features = [ "stream", "client", "http1" ], optional = true }
-itoa = "0.4"
+itoa = "1.0"
 log = "0.4"
 percent-encoding = "2.1"
 ring = { version = "0.17" }
@@ -32,9 +33,9 @@ serde = "1"
 serde_derive = "1"
 serde_json = "1"
 tempfile = "3"
-thiserror = "1.0"
-untrusted = "0.7"
-url = "2"
+thiserror = "2.0"
+untrusted = "0.9"
+url = { version = "2", optional = true }
 
 [dev-dependencies]
 assert_matches = "1.5.0"
@@ -47,7 +48,8 @@ pretty_assertions = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [features]
-default = ["hyper", "hyper/tcp"]
+default = ["hyper"]
+hyper = ["dep:http", "dep:hyper", "dep:url", "hyper/tcp"]
 
 wasm32_unknown_unknown_js = ["ring/wasm32_unknown_unknown_js"]
 

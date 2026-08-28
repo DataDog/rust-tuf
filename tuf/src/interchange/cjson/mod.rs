@@ -300,12 +300,14 @@ impl Value {
                 buf.extend(b"false");
                 Ok(())
             }
-            Value::Number(Number::I64(n)) => itoa::write(buf, n)
-                .map(|_| ())
-                .map_err(|err| format!("Write error: {}", err)),
-            Value::Number(Number::U64(n)) => itoa::write(buf, n)
-                .map(|_| ())
-                .map_err(|err| format!("Write error: {}", err)),
+            Value::Number(Number::I64(n)) => {
+                buf.extend(itoa::Buffer::new().format(n).bytes());
+                Ok(())
+            }
+            Value::Number(Number::U64(n)) => {
+                buf.extend(itoa::Buffer::new().format(n).bytes());
+                Ok(())
+            }
             Value::String(ref s) => {
                 // OLPC Canonical JSON (https://wiki.laptop.org/go/Canonical_JSON): escape only
                 // `\` and `"`; all other bytes — including control chars — emit literally.
@@ -400,6 +402,25 @@ mod test {
         let mut out = Vec::new();
         jsn.write(&mut out).unwrap();
         assert_eq!(&out, b"\"wat\"");
+    }
+
+    #[test]
+    fn write_numbers() {
+        for (value, expected) in [
+            (
+                Value::Number(Number::I64(i64::MIN)),
+                b"-9223372036854775808" as &[u8],
+            ),
+            (Value::Number(Number::I64(0)), b"0"),
+            (
+                Value::Number(Number::U64(u64::MAX)),
+                b"18446744073709551615",
+            ),
+        ] {
+            let mut out = Vec::new();
+            value.write(&mut out).unwrap();
+            assert_eq!(out, expected);
+        }
     }
 
     #[test]

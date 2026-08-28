@@ -3,6 +3,8 @@
 //! # Example
 //!
 //! ```no_run
+//! # #[cfg(feature = "hyper")]
+//! # mod hyper_example {
 //! # use futures_executor::block_on;
 //! # use hyper::client::Client as HttpClient;
 //! # use std::path::PathBuf;
@@ -20,7 +22,7 @@
 //! #      vec![PublicKey::from_ed25519(PUBLIC_KEY).unwrap()]
 //! # }
 //! #
-//! # fn main() -> Result<()> {
+//! # pub fn run() -> Result<()> {
 //! # block_on(async {
 //! let root_public_keys = load_root_public_keys();
 //! let local = FileSystemRepository::<Json>::new(PathBuf::from("~/.rustup"))?;
@@ -45,6 +47,8 @@
 //! # Ok(())
 //! # })
 //! # }
+//! # }
+//! # fn main() {}
 //! ```
 
 use chrono::{offset::Utc, DateTime};
