@@ -29,6 +29,7 @@ pub enum Error {
     IllegalArgument(String),
 
     /// Generic error for HTTP connections.
+    #[cfg(feature = "hyper")]
     #[error("http error for {uri}")]
     Http {
         /// URI Resource that resulted in the error.
@@ -52,6 +53,7 @@ pub enum Error {
     },
 
     /// Unexpected HTTP response status.
+    #[cfg(feature = "hyper")]
     #[error("error getting {uri}: request failed with status code {code}")]
     BadHttpStatus {
         /// URI Resource that resulted in the error.
