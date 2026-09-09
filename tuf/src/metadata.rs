@@ -3,20 +3,22 @@
 use chrono::offset::Utc;
 use chrono::{DateTime, Duration};
 use futures_io::AsyncRead;
-use serde::de::{Deserialize, DeserializeOwned, Deserializer, Error as DeserializeError};
-use serde::ser::{Error as SerializeError, Serialize, Serializer};
-use serde_derive::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer, de::DeserializeOwned,
+    de::Error as DeserializeError, ser::Error as SerializeError,
+};
 use std::borrow::{Borrow, Cow};
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Display};
 use std::marker::PhantomData;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::str;
 
+use crate::Result;
 use crate::crypto::{self, HashAlgorithm, HashValue, KeyId, PrivateKey, PublicKey, Signature};
 use crate::error::Error;
-use crate::interchange::cjson::shims;
-use crate::interchange::DataInterchange;
-use crate::Result;
+use crate::pouf::Pouf;
+use crate::pouf::pouf1::shims;
 
 #[rustfmt::skip]
 static PATH_ILLEGAL_COMPONENTS: &[&str] = &[
@@ -206,31 +208,105 @@ impl Display for Role {
     }
 }
 
-/// Enum used for addressing versioned TUF metadata.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Hash)]
-pub enum MetadataVersion {
-    /// The metadata is unversioned. This is the latest version of the metadata.
-    None,
-    /// The metadata is addressed by a specific version number.
-    Number(u64),
-}
+/// Wrapper struct used for TUF metadata version numbers.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MetadataVersion(NonZeroU64);
 
 impl Display for MetadataVersion {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            MetadataVersion::None => f.write_str("none"),
-            MetadataVersion::Number(version) => write!(f, "{}", version),
-        }
+        write!(f, "{}", self.0)
     }
 }
 
 impl MetadataVersion {
-    /// Converts this struct into the string used for addressing metadata.
-    pub fn prefix(&self) -> String {
-        match *self {
-            MetadataVersion::None => String::new(),
-            MetadataVersion::Number(ref x) => format!("{}.", x),
+    /// Initial metadata version number 1.
+    pub const ONE: Self = MetadataVersion(NonZeroU64::new(1).unwrap());
+
+    /// Create a new `MetadataVersion` from a `NonZeroU64`.
+    pub const fn new(version: NonZeroU64) -> Self {
+        MetadataVersion(version)
+    }
+
+    /// Returns the underlying version number as a `u64`.
+    pub const fn get(&self) -> u64 {
+        self.0.get()
+    }
+
+    /// Checked integer addition. Computes `self + rhs`, returning `None` if overflow occurred.
+    pub const fn checked_add(self, rhs: u64) -> Option<Self> {
+        match self.0.checked_add(rhs) {
+            Some(n) => Some(MetadataVersion(n)),
+            None => None,
         }
+    }
+}
+
+impl From<NonZeroU32> for MetadataVersion {
+    fn from(version: NonZeroU32) -> Self {
+        MetadataVersion(NonZeroU64::from(version))
+    }
+}
+
+impl From<NonZeroU64> for MetadataVersion {
+    fn from(version: NonZeroU64) -> Self {
+        MetadataVersion(version)
+    }
+}
+
+impl From<MetadataVersion> for NonZeroU64 {
+    fn from(version: MetadataVersion) -> Self {
+        version.0
+    }
+}
+
+impl From<MetadataVersion> for u64 {
+    fn from(version: MetadataVersion) -> Self {
+        version.0.get()
+    }
+}
+
+/// Wrapper struct used for TUF metadata role thresholds.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MetadataThreshold(NonZeroU32);
+
+impl Display for MetadataThreshold {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl MetadataThreshold {
+    /// Initial threshold 1.
+    pub const ONE: Self = MetadataThreshold(NonZeroU32::new(1).unwrap());
+
+    /// Create a new `MetadataThreshold` from a `NonZeroU32`.
+    pub const fn new(threshold: NonZeroU32) -> Self {
+        MetadataThreshold(threshold)
+    }
+
+    /// Returns the underlying threshold value as a `u32`.
+    pub const fn get(&self) -> u32 {
+        self.0.get()
+    }
+}
+
+impl From<NonZeroU32> for MetadataThreshold {
+    fn from(threshold: NonZeroU32) -> Self {
+        MetadataThreshold(threshold)
+    }
+}
+
+impl From<MetadataThreshold> for NonZeroU32 {
+    fn from(threshold: MetadataThreshold) -> Self {
+        threshold.0
+    }
+}
+
+impl From<MetadataThreshold> for u32 {
+    fn from(threshold: MetadataThreshold) -> Self {
+        threshold.0.get()
     }
 }
 
@@ -240,7 +316,7 @@ pub trait Metadata: Debug + PartialEq + Serialize + DeserializeOwned {
     const ROLE: Role;
 
     /// The version number.
-    fn version(&self) -> u64;
+    fn version(&self) -> MetadataVersion;
 
     /// An immutable reference to the metadata's expiration `DateTime`.
     fn expires(&self) -> &DateTime<Utc>;
@@ -256,7 +332,7 @@ pub struct RawSignedMetadata<D, M> {
 
 impl<D, M> RawSignedMetadata<D, M>
 where
-    D: DataInterchange,
+    D: Pouf,
     M: Metadata,
 {
     /// Create a new [`RawSignedMetadata`] using the provided `bytes`.
@@ -317,14 +393,14 @@ impl<D> RawSignedMetadataSet<D> {
 #[derive(Default)]
 pub struct RawSignedMetadataSetBuilder<D>
 where
-    D: DataInterchange,
+    D: Pouf,
 {
     metadata: RawSignedMetadataSet<D>,
 }
 
 impl<D> RawSignedMetadataSetBuilder<D>
 where
-    D: DataInterchange,
+    D: Pouf,
 {
     /// Create a new [RawSignedMetadataSetBuilder].
     pub fn new() -> Self {
@@ -372,7 +448,7 @@ where
 #[derive(Debug, Clone)]
 pub struct SignedMetadataBuilder<D, M>
 where
-    D: DataInterchange,
+    D: Pouf,
 {
     signatures: HashMap<KeyId, Signature>,
     metadata: D::RawData,
@@ -382,7 +458,7 @@ where
 
 impl<D, M> SignedMetadataBuilder<D, M>
 where
-    D: DataInterchange,
+    D: Pouf,
     M: Metadata,
 {
     /// Create a new `SignedMetadataBuilder` from a given `Metadata`.
@@ -420,11 +496,7 @@ where
     /// Construct a new `SignedMetadata` using the included signatures, sorting the signatures by
     /// `KeyId`.
     pub fn build(self) -> SignedMetadata<D, M> {
-        let mut signatures = self
-            .signatures
-            .into_iter()
-            .map(|(_k, v)| v)
-            .collect::<Vec<_>>();
+        let mut signatures = self.signatures.into_values().collect::<Vec<_>>();
         signatures.sort_unstable_by(|a, b| a.key_id().cmp(b.key_id()));
 
         SignedMetadata {
@@ -439,7 +511,7 @@ where
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SignedMetadata<D, M>
 where
-    D: DataInterchange,
+    D: Pouf,
 {
     signatures: Vec<Signature>,
     #[serde(rename = "signed")]
@@ -450,7 +522,7 @@ where
 
 impl<D, M> SignedMetadata<D, M>
 where
-    D: DataInterchange,
+    D: Pouf,
     M: Metadata,
 {
     /// Create a new `SignedMetadata`. The supplied private key is used to sign the canonicalized
@@ -459,14 +531,14 @@ where
     /// ```
     /// # use chrono::prelude::*;
     /// # use tuf::crypto::{Ed25519PrivateKey, PrivateKey, SignatureScheme, HashAlgorithm};
-    /// # use tuf::interchange::Json;
+    /// # use tuf::pouf::Pouf1;
     /// # use tuf::metadata::{SignedMetadata, SnapshotMetadataBuilder};
     /// #
     /// # let key: &[u8] = include_bytes!("../tests/ed25519/ed25519-1.pk8.der");
     /// let key = Ed25519PrivateKey::from_pkcs8(&key).unwrap();
     ///
     /// let snapshot = SnapshotMetadataBuilder::new().build().unwrap();
-    /// SignedMetadata::<Json, _>::new(&snapshot, &key).unwrap();
+    /// SignedMetadata::<Pouf1, _>::new(&snapshot, &key).unwrap();
     /// ```
     pub fn new(metadata: &M, private_key: &dyn PrivateKey) -> Result<Self> {
         let raw = D::serialize(metadata)?;
@@ -487,10 +559,10 @@ where
     /// hash of the returned bytes will match a hash included in, for example, a snapshot metadata
     /// file, as:
     /// * Parsing metadata removes unknown fields, which would not be included in the returned
-    /// bytes,
-    /// * DataInterchange implementations only guarantee the bytes are canonical for the purpose of
-    /// a signature. Metadata obtained from a remote source may have included different whitespace
-    /// or ordered fields in a way that is not preserved when parsing that metadata.
+    ///   bytes,
+    /// * [Pouf] implementations only guarantee the bytes are canonical for the purpose of a
+    ///   signature. Metadata obtained from a remote source may have included different whitespace
+    ///   or ordered fields in a way that is not preserved when parsing that metadata.
     pub fn to_raw(&self) -> Result<RawSignedMetadata<D, M>> {
         let bytes = D::canonicalize(&D::serialize(self)?)?;
         Ok(RawSignedMetadata::new(bytes))
@@ -507,7 +579,7 @@ where
     /// ```
     /// # use chrono::prelude::*;
     /// # use tuf::crypto::{Ed25519PrivateKey, PrivateKey, SignatureScheme, HashAlgorithm};
-    /// # use tuf::interchange::Json;
+    /// # use tuf::pouf::Pouf1;
     /// # use tuf::metadata::{SignedMetadata, SnapshotMetadataBuilder};
     /// #
     /// let key_1: &[u8] = include_bytes!("../tests/ed25519/ed25519-1.pk8.der");
@@ -519,7 +591,7 @@ where
     /// let key_2 = Ed25519PrivateKey::from_pkcs8(&key_2).unwrap();
     ///
     /// let snapshot = SnapshotMetadataBuilder::new().build().unwrap();
-    /// let mut snapshot = SignedMetadata::<Json, _>::new(&snapshot, &key_1).unwrap();
+    /// let mut snapshot = SignedMetadata::<Pouf1, _>::new(&snapshot, &key_1).unwrap();
     ///
     /// snapshot.add_signature(&key_2).unwrap();
     /// assert_eq!(snapshot.signatures().len(), 2);
@@ -575,13 +647,13 @@ where
     /// This operation is generally unsafe to do with metadata obtained from an untrusted source,
     /// but rolling forward to the most recent root.json requires using the version number of the
     /// latest root.json.
-    pub(crate) fn parse_version_untrusted(&self) -> Result<u64> {
+    pub(crate) fn parse_version_untrusted(&self) -> Result<MetadataVersion> {
         #[derive(Deserialize)]
-        pub struct MetadataVersion {
-            version: u64,
+        pub struct VersionShim {
+            version: MetadataVersion,
         }
 
-        let meta: MetadataVersion = D::deserialize(&self.metadata)?;
+        let meta: VersionShim = D::deserialize(&self.metadata)?;
         Ok(meta.version)
     }
 
@@ -595,17 +667,17 @@ where
 
 /// Helper to construct `RootMetadata`.
 pub struct RootMetadataBuilder {
-    version: u64,
+    version: MetadataVersion,
     expires: DateTime<Utc>,
     consistent_snapshot: bool,
     keys: HashMap<KeyId, PublicKey>,
-    root_threshold: u32,
+    root_threshold: MetadataThreshold,
     root_key_ids: HashSet<KeyId>,
-    snapshot_threshold: u32,
+    snapshot_threshold: MetadataThreshold,
     snapshot_key_ids: HashSet<KeyId>,
-    targets_threshold: u32,
+    targets_threshold: MetadataThreshold,
     targets_key_ids: HashSet<KeyId>,
-    timestamp_threshold: u32,
+    timestamp_threshold: MetadataThreshold,
     timestamp_key_ids: HashSet<KeyId>,
 }
 
@@ -618,24 +690,24 @@ impl RootMetadataBuilder {
     /// * role thresholds: 1
     pub fn new() -> Self {
         RootMetadataBuilder {
-            version: 1,
+            version: MetadataVersion::ONE,
             expires: Utc::now() + Duration::days(365),
             consistent_snapshot: true,
             keys: HashMap::new(),
-            root_threshold: 1,
+            root_threshold: MetadataThreshold::ONE,
             root_key_ids: HashSet::new(),
-            snapshot_threshold: 1,
+            snapshot_threshold: MetadataThreshold::ONE,
             snapshot_key_ids: HashSet::new(),
-            targets_threshold: 1,
+            targets_threshold: MetadataThreshold::ONE,
             targets_key_ids: HashSet::new(),
-            timestamp_threshold: 1,
+            timestamp_threshold: MetadataThreshold::ONE,
             timestamp_key_ids: HashSet::new(),
         }
     }
 
     /// Set the version number for this metadata.
-    pub fn version(mut self, version: u64) -> Self {
-        self.version = version;
+    pub fn version(mut self, version: impl Into<MetadataVersion>) -> Self {
+        self.version = version.into();
         self
     }
 
@@ -652,8 +724,8 @@ impl RootMetadataBuilder {
     }
 
     /// Set the root threshold.
-    pub fn root_threshold(mut self, threshold: u32) -> Self {
-        self.root_threshold = threshold;
+    pub fn root_threshold(mut self, threshold: impl Into<MetadataThreshold>) -> Self {
+        self.root_threshold = threshold.into();
         self
     }
 
@@ -666,8 +738,8 @@ impl RootMetadataBuilder {
     }
 
     /// Set the snapshot threshold.
-    pub fn snapshot_threshold(mut self, threshold: u32) -> Self {
-        self.snapshot_threshold = threshold;
+    pub fn snapshot_threshold(mut self, threshold: impl Into<MetadataThreshold>) -> Self {
+        self.snapshot_threshold = threshold.into();
         self
     }
 
@@ -680,8 +752,8 @@ impl RootMetadataBuilder {
     }
 
     /// Set the targets threshold.
-    pub fn targets_threshold(mut self, threshold: u32) -> Self {
-        self.targets_threshold = threshold;
+    pub fn targets_threshold(mut self, threshold: impl Into<MetadataThreshold>) -> Self {
+        self.targets_threshold = threshold.into();
         self
     }
 
@@ -694,8 +766,8 @@ impl RootMetadataBuilder {
     }
 
     /// Set the timestamp threshold.
-    pub fn timestamp_threshold(mut self, threshold: u32) -> Self {
-        self.timestamp_threshold = threshold;
+    pub fn timestamp_threshold(mut self, threshold: impl Into<MetadataThreshold>) -> Self {
+        self.timestamp_threshold = threshold.into();
         self
     }
 
@@ -725,7 +797,7 @@ impl RootMetadataBuilder {
     /// Construct a new `SignedMetadata<D, RootMetadata>`.
     pub fn signed<D>(self, private_key: &dyn PrivateKey) -> Result<SignedMetadata<D, RootMetadata>>
     where
-        D: DataInterchange,
+        D: Pouf,
     {
         SignedMetadata::new(&self.build()?, private_key)
     }
@@ -759,37 +831,30 @@ impl From<RootMetadata> for RootMetadataBuilder {
 /// Metadata for the root role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootMetadata {
-    version: u64,
+    version: MetadataVersion,
     expires: DateTime<Utc>,
     consistent_snapshot: bool,
     keys: HashMap<KeyId, PublicKey>,
-    root: RoleDefinition,
-    snapshot: RoleDefinition,
-    targets: RoleDefinition,
-    timestamp: RoleDefinition,
+    root: RoleDefinition<RootMetadata>,
+    snapshot: RoleDefinition<SnapshotMetadata>,
+    targets: RoleDefinition<TargetsMetadata>,
+    timestamp: RoleDefinition<TimestampMetadata>,
     additional_fields: HashMap<String, serde_json::Value>,
 }
 
 impl RootMetadata {
     /// Create new `RootMetadata`.
     pub fn new(
-        version: u64,
+        version: MetadataVersion,
         expires: DateTime<Utc>,
         consistent_snapshot: bool,
         keys: HashMap<KeyId, PublicKey>,
-        root: RoleDefinition,
-        snapshot: RoleDefinition,
-        targets: RoleDefinition,
-        timestamp: RoleDefinition,
+        root: RoleDefinition<RootMetadata>,
+        snapshot: RoleDefinition<SnapshotMetadata>,
+        targets: RoleDefinition<TargetsMetadata>,
+        timestamp: RoleDefinition<TimestampMetadata>,
         additional_fields: HashMap<String, serde_json::Value>,
     ) -> Result<Self> {
-        if version < 1 {
-            return Err(Error::IllegalArgument(format!(
-                "Metadata version must be greater than zero. Found: {}",
-                version
-            )));
-        }
-
         Ok(RootMetadata {
             version,
             expires,
@@ -847,22 +912,22 @@ impl RootMetadata {
     }
 
     /// An immutable reference to the root role's definition.
-    pub fn root(&self) -> &RoleDefinition {
+    pub fn root(&self) -> &RoleDefinition<RootMetadata> {
         &self.root
     }
 
     /// An immutable reference to the snapshot role's definition.
-    pub fn snapshot(&self) -> &RoleDefinition {
+    pub fn snapshot(&self) -> &RoleDefinition<SnapshotMetadata> {
         &self.snapshot
     }
 
     /// An immutable reference to the targets role's definition.
-    pub fn targets(&self) -> &RoleDefinition {
+    pub fn targets(&self) -> &RoleDefinition<TargetsMetadata> {
         &self.targets
     }
 
     /// An immutable reference to the timestamp role's definition.
-    pub fn timestamp(&self) -> &RoleDefinition {
+    pub fn timestamp(&self) -> &RoleDefinition<TimestampMetadata> {
         &self.timestamp
     }
 
@@ -875,7 +940,7 @@ impl RootMetadata {
 impl Metadata for RootMetadata {
     const ROLE: Role = Role::Root;
 
-    fn version(&self) -> u64 {
+    fn version(&self) -> MetadataVersion {
         self.version
     }
 
@@ -906,37 +971,32 @@ impl<'de> Deserialize<'de> for RootMetadata {
 
 /// The definition of what allows a role to be trusted.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RoleDefinition {
-    threshold: u32,
+pub struct RoleDefinition<M: Metadata> {
+    threshold: MetadataThreshold,
     key_ids: HashSet<KeyId>,
+    _metadata: PhantomData<M>,
 }
 
-impl RoleDefinition {
+impl<M: Metadata> RoleDefinition<M> {
     /// Create a new [RoleDefinition] with a given threshold and set of authorized [KeyId]s.
-    pub fn new(threshold: u32, key_ids: HashSet<KeyId>) -> Result<Self> {
-        if threshold < 1 {
-            return Err(Error::IllegalArgument(format!("Threshold: {}", threshold)));
-        }
-
-        if key_ids.is_empty() {
-            return Err(Error::IllegalArgument(
-                "Cannot define a role with no associated key IDs".into(),
-            ));
-        }
-
-        if (key_ids.len() as u64) < u64::from(threshold) {
-            return Err(Error::IllegalArgument(format!(
-                "Cannot have a threshold greater than the number of associated key IDs. {} vs. {}",
+    pub fn new(threshold: MetadataThreshold, key_ids: HashSet<KeyId>) -> Result<Self> {
+        if (key_ids.len() as u64) < u64::from(threshold.get()) {
+            return Err(Error::MetadataRoleDoesNotHaveEnoughKeyIds {
+                role: M::ROLE.into(),
+                key_ids: key_ids.len(),
                 threshold,
-                key_ids.len()
-            )));
+            });
         }
 
-        Ok(RoleDefinition { threshold, key_ids })
+        Ok(RoleDefinition {
+            threshold,
+            key_ids,
+            _metadata: PhantomData,
+        })
     }
 
     /// The threshold number of signatures required for the role to be trusted.
-    pub fn threshold(&self) -> u32 {
+    pub fn threshold(&self) -> MetadataThreshold {
         self.threshold
     }
 
@@ -946,20 +1006,18 @@ impl RoleDefinition {
     }
 }
 
-impl Serialize for RoleDefinition {
+impl<M: Metadata> Serialize for RoleDefinition<M> {
     fn serialize<S>(&self, ser: S) -> ::std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        shims::RoleDefinition::from(self)
-            .map_err(|e| SerializeError::custom(format!("{:?}", e)))?
-            .serialize(ser)
+        shims::RoleDefinition::from(self).serialize(ser)
     }
 }
 
-impl<'de> Deserialize<'de> for RoleDefinition {
+impl<'de, M: Metadata> Deserialize<'de> for RoleDefinition<M> {
     fn deserialize<D: Deserializer<'de>>(de: D) -> ::std::result::Result<Self, D::Error> {
-        let intermediate: shims::RoleDefinition = Deserialize::deserialize(de)?;
+        let intermediate = shims::RoleDefinition::deserialize(de)?;
         intermediate
             .try_into()
             .map_err(|e| DeserializeError::custom(format!("{:?}", e)))
@@ -969,7 +1027,7 @@ impl<'de> Deserialize<'de> for RoleDefinition {
 /// Wrapper for a path to metadata.
 ///
 /// Note: This should **not** contain the file extension. This is automatically added by the
-/// library depending on what type of data interchange format is being used.
+/// library depending on what type of data pouf format is being used.
 ///
 /// ```
 /// use tuf::metadata::MetadataPath;
@@ -1036,22 +1094,26 @@ impl MetadataPath {
     ///
     /// ```
     /// # use tuf::crypto::HashValue;
-    /// # use tuf::interchange::Json;
+    /// # use tuf::pouf::Pouf1;
     /// # use tuf::metadata::{MetadataPath, MetadataVersion};
     /// #
     /// let path = MetadataPath::new("foo/bar").unwrap();
-    /// assert_eq!(path.components::<Json>(MetadataVersion::None),
+    /// assert_eq!(path.components::<Pouf1>(None),
     ///            ["foo".to_string(), "bar.json".to_string()]);
-    /// assert_eq!(path.components::<Json>(MetadataVersion::Number(1)),
+    /// assert_eq!(path.components::<Pouf1>(Some(MetadataVersion::ONE)),
     ///            ["foo".to_string(), "1.bar.json".to_string()]);
     /// ```
-    pub fn components<D>(&self, version: MetadataVersion) -> Vec<String>
+    pub fn components<D>(&self, version: Option<MetadataVersion>) -> Vec<String>
     where
-        D: DataInterchange,
+        D: Pouf,
     {
         let mut buf: Vec<String> = self.0.split('/').map(|s| s.to_string()).collect();
         let len = buf.len();
-        buf[len - 1] = format!("{}{}.{}", version.prefix(), buf[len - 1], D::extension());
+        let prefix = match version {
+            Some(version) => format!("{}.", version),
+            None => String::new(),
+        };
+        buf[len - 1] = format!("{}{}.{}", prefix, buf[len - 1], D::extension());
         buf
     }
 }
@@ -1082,9 +1144,9 @@ impl<'de> Deserialize<'de> for MetadataPath {
 
 /// Helper to construct `TimestampMetadata`.
 pub struct TimestampMetadataBuilder {
-    version: u64,
+    version: MetadataVersion,
     expires: DateTime<Utc>,
-    snapshot: MetadataDescription,
+    snapshot: MetadataDescription<SnapshotMetadata>,
 }
 
 impl TimestampMetadataBuilder {
@@ -1097,7 +1159,7 @@ impl TimestampMetadataBuilder {
         hash_algs: &[HashAlgorithm],
     ) -> Result<Self>
     where
-        D: DataInterchange,
+        D: Pouf,
     {
         let raw_snapshot = snapshot.to_raw()?;
         let description = MetadataDescription::from_slice(
@@ -1114,17 +1176,17 @@ impl TimestampMetadataBuilder {
     ///
     /// * version: 1
     /// * expires: 1 day from the current time.
-    pub fn from_metadata_description(description: MetadataDescription) -> Self {
+    pub fn from_metadata_description(description: MetadataDescription<SnapshotMetadata>) -> Self {
         TimestampMetadataBuilder {
-            version: 1,
+            version: MetadataVersion::ONE,
             expires: Utc::now() + Duration::days(1),
             snapshot: description,
         }
     }
 
     /// Set the version number for this metadata.
-    pub fn version(mut self, version: u64) -> Self {
-        self.version = version;
+    pub fn version(mut self, version: impl Into<MetadataVersion>) -> Self {
+        self.version = version.into();
         self
     }
 
@@ -1150,7 +1212,7 @@ impl TimestampMetadataBuilder {
         private_key: &dyn PrivateKey,
     ) -> Result<SignedMetadata<D, TimestampMetadata>>
     where
-        D: DataInterchange,
+        D: Pouf,
     {
         SignedMetadata::new(&self.build()?, private_key)
     }
@@ -1159,27 +1221,20 @@ impl TimestampMetadataBuilder {
 /// Metadata for the timestamp role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimestampMetadata {
-    version: u64,
+    version: MetadataVersion,
     expires: DateTime<Utc>,
-    snapshot: MetadataDescription,
+    snapshot: MetadataDescription<SnapshotMetadata>,
     additional_fields: HashMap<String, serde_json::Value>,
 }
 
 impl TimestampMetadata {
     /// Create new `TimestampMetadata`.
     pub fn new(
-        version: u64,
+        version: MetadataVersion,
         expires: DateTime<Utc>,
-        snapshot: MetadataDescription,
+        snapshot: MetadataDescription<SnapshotMetadata>,
         additional_fields: HashMap<String, serde_json::Value>,
     ) -> Result<Self> {
-        if version < 1 {
-            return Err(Error::IllegalArgument(format!(
-                "Metadata version must be greater than zero. Found: {}",
-                version
-            )));
-        }
-
         Ok(TimestampMetadata {
             version,
             expires,
@@ -1189,7 +1244,7 @@ impl TimestampMetadata {
     }
 
     /// An immutable reference to the snapshot description.
-    pub fn snapshot(&self) -> &MetadataDescription {
+    pub fn snapshot(&self) -> &MetadataDescription<SnapshotMetadata> {
         &self.snapshot
     }
 
@@ -1202,7 +1257,7 @@ impl TimestampMetadata {
 impl Metadata for TimestampMetadata {
     const ROLE: Role = Role::Timestamp;
 
-    fn version(&self) -> u64 {
+    fn version(&self) -> MetadataVersion {
         self.version
     }
 
@@ -1232,24 +1287,21 @@ impl<'de> Deserialize<'de> for TimestampMetadata {
 }
 
 /// Description of a piece of metadata, used in verification.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct MetadataDescription {
-    version: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataDescription<M: Metadata> {
+    version: MetadataVersion,
     length: Option<usize>,
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     hashes: HashMap<HashAlgorithm, HashValue>,
+    _metadata: PhantomData<M>,
 }
 
-impl MetadataDescription {
+impl<M: Metadata> MetadataDescription<M> {
     /// Create a `MetadataDescription` from a slice. Size and hashes will be calculated.
-    pub fn from_slice(buf: &[u8], version: u64, hash_algs: &[HashAlgorithm]) -> Result<Self> {
-        if version < 1 {
-            return Err(Error::IllegalArgument(
-                "Version must be greater than zero".into(),
-            ));
-        }
-
+    pub fn from_slice(
+        buf: &[u8],
+        version: MetadataVersion,
+        hash_algs: &[HashAlgorithm],
+    ) -> Result<Self> {
         let hashes = if hash_algs.is_empty() {
             HashMap::new()
         } else {
@@ -1260,31 +1312,26 @@ impl MetadataDescription {
             version,
             length: Some(buf.len()),
             hashes,
+            _metadata: PhantomData,
         })
     }
 
     /// Create a new `MetadataDescription`.
     pub fn new(
-        version: u64,
+        version: MetadataVersion,
         length: Option<usize>,
         hashes: HashMap<HashAlgorithm, HashValue>,
     ) -> Result<Self> {
-        if version < 1 {
-            return Err(Error::IllegalArgument(format!(
-                "Metadata version must be greater than zero. Found: {}",
-                version
-            )));
-        }
-
         Ok(MetadataDescription {
             version,
             length,
             hashes,
+            _metadata: PhantomData,
         })
     }
 
     /// The version of the described metadata.
-    pub fn version(&self) -> u64 {
+    pub fn version(&self) -> MetadataVersion {
         self.version
     }
 
@@ -1299,9 +1346,18 @@ impl MetadataDescription {
     }
 }
 
-impl<'de> Deserialize<'de> for MetadataDescription {
+impl<M: Metadata> Serialize for MetadataDescription<M> {
+    fn serialize<S>(&self, ser: S) -> ::std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        shims::MetadataDescription::from(self).serialize(ser)
+    }
+}
+
+impl<'de, M: Metadata> Deserialize<'de> for MetadataDescription<M> {
     fn deserialize<D: Deserializer<'de>>(de: D) -> ::std::result::Result<Self, D::Error> {
-        let intermediate: shims::MetadataDescription = Deserialize::deserialize(de)?;
+        let intermediate = shims::MetadataDescription::deserialize(de)?;
         intermediate
             .try_into()
             .map_err(|e| DeserializeError::custom(format!("{:?}", e)))
@@ -1310,9 +1366,9 @@ impl<'de> Deserialize<'de> for MetadataDescription {
 
 /// Helper to construct `SnapshotMetadata`.
 pub struct SnapshotMetadataBuilder {
-    version: u64,
+    version: MetadataVersion,
     expires: DateTime<Utc>,
-    meta: HashMap<MetadataPath, MetadataDescription>,
+    meta: HashMap<MetadataPath, MetadataDescription<TargetsMetadata>>,
 }
 
 impl SnapshotMetadataBuilder {
@@ -1322,7 +1378,7 @@ impl SnapshotMetadataBuilder {
     /// * expires: 7 days from the current time.
     pub fn new() -> Self {
         SnapshotMetadataBuilder {
-            version: 1,
+            version: MetadataVersion::ONE,
             expires: Utc::now() + Duration::days(7),
             meta: HashMap::new(),
         }
@@ -1337,14 +1393,14 @@ impl SnapshotMetadataBuilder {
         hash_algs: &[HashAlgorithm],
     ) -> Result<Self>
     where
-        D: DataInterchange,
+        D: Pouf,
     {
         SnapshotMetadataBuilder::new().insert_metadata(targets, hash_algs)
     }
 
     /// Set the version number for this metadata.
-    pub fn version(mut self, version: u64) -> Self {
-        self.version = version;
+    pub fn version(mut self, version: impl Into<MetadataVersion>) -> Self {
+        self.version = version.into();
         self
     }
 
@@ -1362,7 +1418,7 @@ impl SnapshotMetadataBuilder {
     ) -> Result<Self>
     where
         M: Metadata,
-        D: DataInterchange,
+        D: Pouf,
     {
         self.insert_metadata_with_path(M::ROLE.name(), metadata, hash_algs)
     }
@@ -1377,7 +1433,7 @@ impl SnapshotMetadataBuilder {
     where
         P: Into<Cow<'static, str>>,
         M: Metadata,
-        D: DataInterchange,
+        D: Pouf,
     {
         let raw_metadata = metadata.to_raw()?;
         let description = MetadataDescription::from_slice(
@@ -1393,7 +1449,7 @@ impl SnapshotMetadataBuilder {
     pub fn insert_metadata_description(
         mut self,
         path: MetadataPath,
-        description: MetadataDescription,
+        description: MetadataDescription<TargetsMetadata>,
     ) -> Self {
         self.meta.insert(path, description);
         self
@@ -1410,7 +1466,7 @@ impl SnapshotMetadataBuilder {
         private_key: &dyn PrivateKey,
     ) -> Result<SignedMetadata<D, SnapshotMetadata>>
     where
-        D: DataInterchange,
+        D: Pouf,
     {
         SignedMetadata::new(&self.build()?, private_key)
     }
@@ -1435,27 +1491,20 @@ impl From<SnapshotMetadata> for SnapshotMetadataBuilder {
 /// Metadata for the snapshot role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotMetadata {
-    version: u64,
+    version: MetadataVersion,
     expires: DateTime<Utc>,
-    meta: HashMap<MetadataPath, MetadataDescription>,
+    meta: HashMap<MetadataPath, MetadataDescription<TargetsMetadata>>,
     additional_fields: HashMap<String, serde_json::Value>,
 }
 
 impl SnapshotMetadata {
     /// Create new `SnapshotMetadata`.
     pub fn new(
-        version: u64,
+        version: MetadataVersion,
         expires: DateTime<Utc>,
-        meta: HashMap<MetadataPath, MetadataDescription>,
+        meta: HashMap<MetadataPath, MetadataDescription<TargetsMetadata>>,
         additional_fields: HashMap<String, serde_json::Value>,
     ) -> Result<Self> {
-        if version < 1 {
-            return Err(Error::IllegalArgument(format!(
-                "Metadata version must be greater than zero. Found: {}",
-                version
-            )));
-        }
-
         Ok(SnapshotMetadata {
             version,
             expires,
@@ -1465,7 +1514,7 @@ impl SnapshotMetadata {
     }
 
     /// An immutable reference to the metadata paths and descriptions.
-    pub fn meta(&self) -> &HashMap<MetadataPath, MetadataDescription> {
+    pub fn meta(&self) -> &HashMap<MetadataPath, MetadataDescription<TargetsMetadata>> {
         &self.meta
     }
 
@@ -1478,7 +1527,7 @@ impl SnapshotMetadata {
 impl Metadata for SnapshotMetadata {
     const ROLE: Role = Role::Snapshot;
 
-    fn version(&self) -> u64 {
+    fn version(&self) -> MetadataVersion {
         self.version
     }
 
@@ -1867,7 +1916,7 @@ impl<'de> Deserialize<'de> for TargetDescription {
 /// Metadata for the targets role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TargetsMetadata {
-    version: u64,
+    version: MetadataVersion,
     expires: DateTime<Utc>,
     targets: HashMap<TargetPath, TargetDescription>,
     delegations: Delegations,
@@ -1877,19 +1926,12 @@ pub struct TargetsMetadata {
 impl TargetsMetadata {
     /// Create new `TargetsMetadata`.
     pub fn new(
-        version: u64,
+        version: MetadataVersion,
         expires: DateTime<Utc>,
         targets: HashMap<TargetPath, TargetDescription>,
         delegations: Delegations,
         additional_fields: HashMap<String, serde_json::Value>,
     ) -> Result<Self> {
-        if version < 1 {
-            return Err(Error::IllegalArgument(format!(
-                "Metadata version must be greater than zero. Found: {}",
-                version
-            )));
-        }
-
         Ok(TargetsMetadata {
             version,
             expires,
@@ -1918,7 +1960,7 @@ impl TargetsMetadata {
 impl Metadata for TargetsMetadata {
     const ROLE: Role = Role::Targets;
 
-    fn version(&self) -> u64 {
+    fn version(&self) -> MetadataVersion {
         self.version
     }
 
@@ -1949,7 +1991,7 @@ impl<'de> Deserialize<'de> for TargetsMetadata {
 
 /// Helper to construct `TargetsMetadata`.
 pub struct TargetsMetadataBuilder {
-    version: u64,
+    version: MetadataVersion,
     expires: DateTime<Utc>,
     targets: HashMap<TargetPath, TargetDescription>,
     delegations: Option<Delegations>,
@@ -1962,7 +2004,7 @@ impl TargetsMetadataBuilder {
     /// * expires: 90 days from the current time.
     pub fn new() -> Self {
         TargetsMetadataBuilder {
-            version: 1,
+            version: MetadataVersion::ONE,
             expires: Utc::now() + Duration::days(90),
             targets: HashMap::new(),
             delegations: None,
@@ -1970,8 +2012,8 @@ impl TargetsMetadataBuilder {
     }
 
     /// Set the version number for this metadata.
-    pub fn version(mut self, version: u64) -> Self {
-        self.version = version;
+    pub fn version(mut self, version: impl Into<MetadataVersion>) -> Self {
+        self.version = version.into();
         self
     }
 
@@ -2039,7 +2081,7 @@ impl TargetsMetadataBuilder {
         private_key: &dyn PrivateKey,
     ) -> Result<SignedMetadata<D, TargetsMetadata>>
     where
-        D: DataInterchange,
+        D: Pouf,
     {
         SignedMetadata::new(&self.build()?, private_key)
     }
@@ -2168,7 +2210,7 @@ impl DelegationsBuilder {
 pub struct Delegation {
     name: MetadataPath,
     terminating: bool,
-    threshold: u32,
+    threshold: MetadataThreshold,
     key_ids: HashSet<KeyId>,
     paths: HashSet<TargetPath>,
 }
@@ -2183,7 +2225,7 @@ impl Delegation {
     pub fn new(
         name: MetadataPath,
         terminating: bool,
-        threshold: u32,
+        threshold: MetadataThreshold,
         key_ids: HashSet<KeyId>,
         paths: HashSet<TargetPath>,
     ) -> Result<Self> {
@@ -2195,11 +2237,7 @@ impl Delegation {
             return Err(Error::IllegalArgument("Cannot have empty paths".into()));
         }
 
-        if threshold < 1 {
-            return Err(Error::IllegalArgument("Cannot have threshold < 1".into()));
-        }
-
-        if (key_ids.len() as u64) < u64::from(threshold) {
+        if (key_ids.len() as u64) < u64::from(threshold.get()) {
             return Err(Error::IllegalArgument(
                 "Cannot have threshold less than number of keys".into(),
             ));
@@ -2230,7 +2268,7 @@ impl Delegation {
     }
 
     /// The delegation's threshold.
-    pub fn threshold(&self) -> u32 {
+    pub fn threshold(&self) -> MetadataThreshold {
         self.threshold
     }
 
@@ -2262,7 +2300,7 @@ impl<'de> Deserialize<'de> for Delegation {
 pub struct DelegationBuilder {
     role: MetadataPath,
     terminating: bool,
-    threshold: u32,
+    threshold: MetadataThreshold,
     key_ids: HashSet<KeyId>,
     paths: HashSet<TargetPath>,
 }
@@ -2273,14 +2311,14 @@ impl DelegationBuilder {
         Self {
             role,
             terminating: false,
-            threshold: 1,
+            threshold: MetadataThreshold::ONE,
             key_ids: HashSet::new(),
             paths: HashSet::new(),
         }
     }
 
     /// The threshold number of signatures required for the delegation to be trusted.
-    pub fn threshold(mut self, threshold: u32) -> Self {
+    pub fn threshold(mut self, threshold: MetadataThreshold) -> Self {
         self.threshold = threshold;
         self
     }
@@ -2319,7 +2357,7 @@ impl DelegationBuilder {
 mod test {
     use super::*;
     use crate::crypto::Ed25519PrivateKey;
-    use crate::interchange::Json;
+    use crate::pouf::Pouf1;
     use crate::verify::verify_signatures;
     use assert_matches::assert_matches;
     use chrono::prelude::*;
@@ -2329,10 +2367,26 @@ mod test {
     use serde_json::json;
     use std::str::FromStr;
 
+    const TWO: NonZeroU32 = NonZeroU32::new(2).unwrap();
+    const THREE: NonZeroU32 = NonZeroU32::new(3).unwrap();
+
     const ED25519_1_PK8: &[u8] = include_bytes!("../tests/ed25519/ed25519-1.pk8.der");
     const ED25519_2_PK8: &[u8] = include_bytes!("../tests/ed25519/ed25519-2.pk8.der");
     const ED25519_3_PK8: &[u8] = include_bytes!("../tests/ed25519/ed25519-3.pk8.der");
     const ED25519_4_PK8: &[u8] = include_bytes!("../tests/ed25519/ed25519-4.pk8.der");
+
+    #[test]
+    fn metadata_versions_support_u64_values() {
+        for value in [u64::from(u32::MAX) + 1, u64::MAX] {
+            let version = MetadataVersion::new(NonZeroU64::new(value).unwrap());
+            assert_eq!(version.get(), value);
+            assert_eq!(serde_json::to_value(version).unwrap(), json!(value));
+            assert_eq!(
+                serde_json::from_value::<MetadataVersion>(json!(value)).unwrap(),
+                version
+            );
+        }
+    }
 
     #[test]
     fn no_pardir_in_target_path() {
@@ -2366,7 +2420,6 @@ mod test {
             assert!(safe_path(path).is_ok());
             assert!(TargetPath::new(path.to_string()).is_ok());
             assert!(MetadataPath::new(path.to_string()).is_ok());
-            assert!(TargetPath::new(path.to_string()).is_ok());
         }
     }
 
@@ -2464,7 +2517,7 @@ mod test {
             KeyId::from_str("4750eaf6878740780d6f97b12dbad079fb012bec88c78de2c380add56d3f51db")
                 .unwrap(),
         ];
-        let role_def = RoleDefinition::new(3, keyids).unwrap();
+        let role_def = RoleDefinition::new(MetadataThreshold::from(THREE), keyids).unwrap();
         let jsn = json!({
             "threshold": 3,
             "keyids": [
@@ -2475,7 +2528,7 @@ mod test {
         });
         let encoded = serde_json::to_value(&role_def).unwrap();
         assert_eq!(encoded, jsn);
-        let decoded: RoleDefinition = serde_json::from_value(encoded).unwrap();
+        let decoded: RoleDefinition<RootMetadata> = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, role_def);
     }
 
@@ -2488,7 +2541,7 @@ mod test {
                 "4750eaf6878740780d6f97b12dbad079fb012bec88c78de2c380add56d3f51db",
             ],
         });
-        assert!(serde_json::from_value::<RoleDefinition>(jsn).is_err());
+        assert!(serde_json::from_value::<RoleDefinition<RootMetadata>>(jsn).is_err());
 
         let jsn = json!({
             "threshold": -1,
@@ -2497,7 +2550,7 @@ mod test {
                 "4750eaf6878740780d6f97b12dbad079fb012bec88c78de2c380add56d3f51db",
             ],
         });
-        assert!(serde_json::from_value::<RoleDefinition>(jsn).is_err());
+        assert!(serde_json::from_value::<RoleDefinition<RootMetadata>>(jsn).is_err());
     }
 
     #[test]
@@ -2508,7 +2561,7 @@ mod test {
         let timestamp_key = Ed25519PrivateKey::from_pkcs8(ED25519_4_PK8).unwrap();
 
         let root = RootMetadataBuilder::new()
-            .expires(Utc.ymd(2017, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2017, 1, 1, 0, 0, 0).unwrap())
             .root_key(root_key.public().clone())
             .snapshot_key(snapshot_key.public().clone())
             .targets_key(targets_key.public().clone())
@@ -2582,6 +2635,61 @@ mod test {
         assert_eq!(decoded, root);
     }
 
+    #[test]
+    fn serde_root_metadata_additional_fields() {
+        let jsn = json!({
+            "_type": "root",
+            "spec_version": "1.0.0",
+            "version": 1,
+            "expires": "2017-01-01T00:00:00Z",
+            "consistent_snapshot": true,
+            "keys": {
+                "09557ed63f91b5b95917d46f66c63ea79bdaef1b008ba823808bca849f1d18a1": {
+                    "keytype": "ed25519",
+                    "scheme": "ed25519",
+                    "keyid_hash_algorithms": ["sha256", "sha512"],
+                    "keyval": {
+                        "public": "1410ae3053aa70bbfa98428a879d64d3002a3578f7dfaaeb1cb0764e860f7e0b",
+                    },
+                },
+            },
+            "roles": {
+                "root": {
+                    "threshold": 1,
+                    "keyids": ["09557ed63f91b5b95917d46f66c63ea79bdaef1b008ba823808bca849f1d18a1"],
+                },
+                "snapshot": {
+                    "threshold": 1,
+                    "keyids": ["09557ed63f91b5b95917d46f66c63ea79bdaef1b008ba823808bca849f1d18a1"],
+                },
+                "targets": {
+                    "threshold": 1,
+                    "keyids": ["09557ed63f91b5b95917d46f66c63ea79bdaef1b008ba823808bca849f1d18a1"],
+                },
+                "timestamp": {
+                    "threshold": 1,
+                    "keyids": ["09557ed63f91b5b95917d46f66c63ea79bdaef1b008ba823808bca849f1d18a1"],
+                },
+            },
+            // additional_fields
+            "custom": {
+                "foo": 42,
+                "bar": "baz",
+            },
+            "quux": true,
+        });
+
+        let root: RootMetadata = serde_json::from_value(jsn.clone()).unwrap();
+        assert_eq!(
+            root.additional_fields()["custom"],
+            json!({"foo": 42, "bar": "baz"})
+        );
+        assert_eq!(root.additional_fields()["quux"], json!(true));
+
+        // make sure additional_fields are passed through serialization as well
+        assert_eq!(jsn, serde_json::to_value(&root).unwrap());
+    }
+
     fn jsn_root_metadata_without_keyid_hash_algos() -> serde_json::Value {
         json!({
             "_type": "root",
@@ -2652,7 +2760,7 @@ mod test {
     #[test]
     fn de_ser_root_metadata_wrong_key_id() {
         let jsn = jsn_root_metadata_without_keyid_hash_algos();
-        let mut jsn_str = str::from_utf8(&Json::canonicalize(&jsn).unwrap())
+        let mut jsn_str = str::from_utf8(&Pouf1::canonicalize(&jsn).unwrap())
             .unwrap()
             .to_owned();
         // Replace the key id to something else.
@@ -2670,7 +2778,7 @@ mod test {
         let root_key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
         let decoded: RootMetadata = serde_json::from_value(jsn).unwrap();
 
-        let signed: SignedMetadata<crate::interchange::cjson::Json, _> =
+        let signed: SignedMetadata<crate::pouf::pouf1::Pouf1, _> =
             SignedMetadata::new(&decoded, &root_key).unwrap();
         let raw_root = signed.to_raw().unwrap();
 
@@ -2678,7 +2786,7 @@ mod test {
             verify_signatures(
                 &MetadataPath::root(),
                 &raw_root,
-                1,
+                MetadataThreshold::ONE,
                 &[root_key.public().clone()]
             ),
             Ok(_)
@@ -2695,7 +2803,7 @@ mod test {
             "signed": jsn_root_metadata_without_keyid_hash_algos()
         });
         let root_key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
-        let decoded: SignedMetadata<crate::interchange::cjson::Json, RootMetadata> =
+        let decoded: SignedMetadata<crate::pouf::pouf1::Pouf1, RootMetadata> =
             serde_json::from_value(jsn).unwrap();
         let raw_root = decoded.to_raw().unwrap();
 
@@ -2703,7 +2811,7 @@ mod test {
             verify_signatures(
                 &MetadataPath::root(),
                 &raw_root,
-                1,
+                MetadataThreshold::ONE,
                 &[root_key.public().clone()]
             ),
             Ok(_)
@@ -2724,16 +2832,20 @@ mod test {
             "signed": jsn_root_metadata_without_keyid_hash_algos()
         });
         let root_key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
-        let decoded: SignedMetadata<crate::interchange::cjson::Json, RootMetadata> =
+        let decoded: SignedMetadata<crate::pouf::pouf1::Pouf1, RootMetadata> =
             serde_json::from_value(jsn).unwrap();
         let raw_root = decoded.to_raw().unwrap();
-
         assert_matches!(
-            verify_signatures(&MetadataPath::root(), &raw_root, 2, &[root_key.public().clone()]),
+            verify_signatures(
+                &MetadataPath::root(),
+                &raw_root,
+                TWO.into(),
+                &[root_key.public().clone()]
+            ),
             Err(Error::MetadataMissingSignatures {
                 role,
                 number_of_valid_signatures: 1,
-                threshold: 2,
+                threshold: MetadataThreshold(TWO),
             })
             if role == MetadataPath::root()
         );
@@ -2741,7 +2853,7 @@ mod test {
             verify_signatures(
                 &MetadataPath::root(),
                 &raw_root,
-                1,
+                MetadataThreshold::ONE,
                 &[root_key.public().clone()]
             ),
             Ok(_)
@@ -2755,7 +2867,7 @@ mod test {
         let key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
         let public_keys = vec![key.public().clone()];
 
-        let mut standard = SignedMetadataBuilder::<Json, M>::from_raw_metadata(metadata.clone())
+        let mut standard = SignedMetadataBuilder::<Pouf1, M>::from_raw_metadata(metadata.clone())
             .unwrap()
             .sign(&key)
             .unwrap()
@@ -2772,7 +2884,7 @@ mod test {
                 "this-too": 42,
             }),
         );
-        let mut custom = SignedMetadataBuilder::<Json, M>::from_raw_metadata(metadata)
+        let mut custom = SignedMetadataBuilder::<Pouf1, M>::from_raw_metadata(metadata)
             .unwrap()
             .sign(&key)
             .unwrap()
@@ -2787,7 +2899,7 @@ mod test {
             verify_signatures(
                 &M::ROLE.into(),
                 &standard.to_raw().unwrap(),
-                1,
+                MetadataThreshold::ONE,
                 &public_keys
             ),
             Ok(_)
@@ -2796,7 +2908,7 @@ mod test {
             verify_signatures(
                 &M::ROLE.into(),
                 &custom.to_raw().unwrap(),
-                1,
+                MetadataThreshold::ONE,
                 std::iter::once(key.public())
             ),
             Ok(_)
@@ -2809,20 +2921,28 @@ mod test {
             verify_signatures(
                 &M::ROLE.into(),
                 &standard.to_raw().unwrap(),
-                1,
+                MetadataThreshold::ONE,
                 std::iter::once(key.public())
             ),
-            Err(Error::MetadataMissingSignatures { role, number_of_valid_signatures: 0, threshold: 1 })
+            Err(Error::MetadataMissingSignatures {
+                role,
+                number_of_valid_signatures: 0,
+                threshold: MetadataThreshold::ONE,
+            })
             if role == M::ROLE.into()
         );
         assert_matches!(
             verify_signatures(
                 &M::ROLE.into(),
                 &custom.to_raw().unwrap(),
-                1,
+                MetadataThreshold::ONE,
                 std::iter::once(key.public())
             ),
-            Err(Error::MetadataMissingSignatures { role, number_of_valid_signatures: 0, threshold: 1 })
+            Err(Error::MetadataMissingSignatures {
+                role,
+                number_of_valid_signatures: 0,
+                threshold: MetadataThreshold::ONE,
+            })
             if role == M::ROLE.into()
         );
     }
@@ -2852,14 +2972,14 @@ mod test {
     #[test]
     fn serde_timestamp_metadata() {
         let description = MetadataDescription::new(
-            1,
+            MetadataVersion::ONE,
             Some(100),
             hashmap! { HashAlgorithm::Sha256 => HashValue::new(vec![]) },
         )
         .unwrap();
 
         let timestamp = TimestampMetadataBuilder::from_metadata_description(description)
-            .expires(Utc.ymd(2017, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2017, 1, 1, 0, 0, 0).unwrap())
             .build()
             .unwrap();
 
@@ -2885,13 +3005,49 @@ mod test {
         assert_eq!(decoded, timestamp);
     }
 
+    #[test]
+    fn serde_timestamp_metadata_additional_fields() {
+        let jsn = json!({
+            "_type": "timestamp",
+            "spec_version": "1.0.0",
+            "version": 1,
+            "expires": "2017-01-01T00:00:00Z",
+            "meta": {
+                "snapshot.json": {
+                    "version": 1,
+                    "length": 100,
+                    "hashes": {
+                        "sha256": "",
+                    },
+                },
+            },
+            // additional_fields
+            "custom": {
+                "foo": 42,
+                "bar": "baz",
+            },
+            "quux": true,
+        });
+
+        let timestamp: TimestampMetadata = serde_json::from_value(jsn.clone()).unwrap();
+        assert_eq!(
+            timestamp.additional_fields()["custom"],
+            json!({"foo": 42, "bar": "baz"})
+        );
+        assert_eq!(timestamp.additional_fields()["quux"], json!(true));
+
+        // make sure additional_fields are passed through serialization as well
+        assert_eq!(jsn, serde_json::to_value(&timestamp).unwrap());
+    }
+
     // Deserialize timestamp metadata with optional length and hashes
     #[test]
     fn serde_timestamp_metadata_without_length_and_hashes() {
-        let description = MetadataDescription::new(1, None, HashMap::new()).unwrap();
+        let description =
+            MetadataDescription::new(MetadataVersion::ONE, None, HashMap::new()).unwrap();
 
         let timestamp = TimestampMetadataBuilder::from_metadata_description(description)
-            .expires(Utc.ymd(2017, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2017, 1, 1, 0, 0, 0).unwrap())
             .build()
             .unwrap();
 
@@ -2904,7 +3060,7 @@ mod test {
                 "snapshot.json": {
                     "version": 1
                 },
-            }
+            },
         });
 
         let encoded = serde_json::to_value(&timestamp).unwrap();
@@ -2964,11 +3120,11 @@ mod test {
     #[test]
     fn serde_snapshot_metadata() {
         let snapshot = SnapshotMetadataBuilder::new()
-            .expires(Utc.ymd(2017, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2017, 1, 1, 0, 0, 0).unwrap())
             .insert_metadata_description(
                 MetadataPath::new("targets").unwrap(),
                 MetadataDescription::new(
-                    1,
+                    MetadataVersion::ONE,
                     Some(100),
                     hashmap! { HashAlgorithm::Sha256 => HashValue::new(vec![]) },
                 )
@@ -2999,14 +3155,49 @@ mod test {
         assert_eq!(decoded, snapshot);
     }
 
+    #[test]
+    fn serde_snapshot_metadata_additional_fields() {
+        let jsn = json!({
+            "_type": "snapshot",
+            "spec_version": "1.0.0",
+            "version": 1,
+            "expires": "2017-01-01T00:00:00Z",
+            "meta": {
+                "targets.json": {
+                    "version": 1,
+                    "length": 100,
+                    "hashes": {
+                        "sha256": "",
+                    },
+                },
+            },
+            // additional_fields
+            "custom": {
+                "foo": 42,
+                "bar": "baz",
+            },
+            "quux": true,
+        });
+
+        let snapshot: SnapshotMetadata = serde_json::from_value(jsn.clone()).unwrap();
+        assert_eq!(
+            snapshot.additional_fields()["custom"],
+            json!({"foo": 42, "bar": "baz"})
+        );
+        assert_eq!(snapshot.additional_fields()["quux"], json!(true));
+
+        // make sure additional_fields are passed through serialization as well
+        assert_eq!(jsn, serde_json::to_value(&snapshot).unwrap());
+    }
+
     // Deserialize snapshot metadata with optional length and hashes
     #[test]
     fn serde_snapshot_optional_length_and_hashes() {
         let snapshot = SnapshotMetadataBuilder::new()
-            .expires(Utc.ymd(2017, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2017, 1, 1, 0, 0, 0).unwrap())
             .insert_metadata_description(
                 MetadataPath::new("targets").unwrap(),
-                MetadataDescription::new(1, None, HashMap::new()).unwrap(),
+                MetadataDescription::new(MetadataVersion::ONE, None, HashMap::new()).unwrap(),
             )
             .build()
             .unwrap();
@@ -3033,7 +3224,7 @@ mod test {
     fn serde_targets_metadata() {
         block_on(async {
             let targets = TargetsMetadataBuilder::new()
-                .expires(Utc.ymd(2017, 1, 1).and_hms(0, 0, 0))
+                .expires(Utc.with_ymd_and_hms(2017, 1, 1, 0, 0, 0).unwrap())
                 .insert_target_from_slice(
                     TargetPath::new("insert-target-from-slice").unwrap(),
                     &b"foo"[..],
@@ -3121,23 +3312,85 @@ mod test {
     }
 
     #[test]
+    fn serde_targets_metadata_additional_fields() {
+        let jsn = json!({
+                "_type": "targets",
+            "spec_version": "1.0.0",
+                "version": 1,
+                "expires": "2017-01-01T00:00:00Z",
+                "targets": {
+                    "insert-target-from-slice": {
+                        "length": 3,
+                        "hashes": {
+                            "sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483\
+                                bfa0f98a5e886266e7ae",
+                        },
+                    },
+                    "insert-target-description-from-slice-with-custom": {
+                        "length": 3,
+                        "hashes": {
+                            "sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483\
+                                bfa0f98a5e886266e7ae",
+                        },
+                    },
+                    "insert-target-from-reader": {
+                        "length": 3,
+                        "hashes": {
+                            "sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483\
+                                bfa0f98a5e886266e7ae",
+                        },
+                    },
+                    "insert-target-description-from-reader-with-custom": {
+                        "length": 3,
+                        "hashes": {
+                            "sha256": "2c26b46b68ffc68ff99b453c1d30413413422d706483\
+                                bfa0f98a5e886266e7ae",
+                        },
+                        "custom": {
+                            "foo": 1,
+                            "bar": "baz",
+                        },
+                    },
+                },
+            // additional_fields
+            "custom": {
+                "foo": 42,
+                "bar": "baz",
+            },
+            "quux": true,
+        });
+
+        let targets: TargetsMetadata = serde_json::from_value(jsn.clone()).unwrap();
+        assert_eq!(
+            targets.additional_fields()["custom"],
+            json!({"foo": 42, "bar": "baz"})
+        );
+        assert_eq!(targets.additional_fields()["quux"], json!(true));
+
+        // make sure additional_fields are passed through serialization as well
+        assert_eq!(jsn, serde_json::to_value(&targets).unwrap());
+    }
+
+    #[test]
     fn serde_targets_with_delegations_metadata() {
         let key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
         let delegations = Delegations::new(
             hashmap! { key.public().key_id().clone() => key.public().clone() },
-            vec![Delegation::new(
-                MetadataPath::new("foo/bar").unwrap(),
-                false,
-                1,
-                hashset!(key.public().key_id().clone()),
-                hashset!(TargetPath::new("baz/quux").unwrap()),
-            )
-            .unwrap()],
+            vec![
+                Delegation::new(
+                    MetadataPath::new("foo/bar").unwrap(),
+                    false,
+                    MetadataThreshold::ONE,
+                    hashset!(key.public().key_id().clone()),
+                    hashset!(TargetPath::new("baz/quux").unwrap()),
+                )
+                .unwrap(),
+            ],
         )
         .unwrap();
 
         let targets = TargetsMetadataBuilder::new()
-            .expires(Utc.ymd(2017, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2017, 1, 1, 0, 0, 0).unwrap())
             .delegations(delegations)
             .build()
             .unwrap();
@@ -3181,11 +3434,11 @@ mod test {
     #[test]
     fn serde_signed_metadata() {
         let snapshot = SnapshotMetadataBuilder::new()
-            .expires(Utc.ymd(2017, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2017, 1, 1, 0, 0, 0).unwrap())
             .insert_metadata_description(
                 MetadataPath::new("targets").unwrap(),
                 MetadataDescription::new(
-                    1,
+                    MetadataVersion::ONE,
                     Some(100),
                     hashmap! { HashAlgorithm::Sha256 => HashValue::new(vec![]) },
                 )
@@ -3196,15 +3449,15 @@ mod test {
 
         let key = Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8).unwrap();
 
-        let signed = SignedMetadata::<Json, _>::new(&snapshot, &key).unwrap();
+        let signed = SignedMetadata::<Pouf1, _>::new(&snapshot, &key).unwrap();
 
         let jsn = json!({
             "signatures": [
                 {
                     "keyid": "a9f3ebc9b138762563a9c27b6edd439959e559709babd123e8d449ba2c18c61a",
                     "sig": "a9b97b2439cd41e9a8c62e4d2f8f73b25a06095e0a994e8631a0\
-                        88977271909af2cc829c68637af98b07ebffeea308cc1a1c83d18fa2\
-                        9ec401493973b3dfa90e",
+                        88977271909af2cc829c68637af98b07ebffeea308cc1a1c83d18\
+                        fa29ec401493973b3dfa90e",
                 }
             ],
             "signed": {
@@ -3226,7 +3479,7 @@ mod test {
 
         let encoded = serde_json::to_value(&signed).unwrap();
         assert_eq!(encoded, jsn, "{:#?} != {:#?}", encoded, jsn);
-        let decoded: SignedMetadata<Json, SnapshotMetadata> =
+        let decoded: SignedMetadata<Pouf1, SnapshotMetadata> =
             serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, signed);
     }
@@ -3261,7 +3514,7 @@ mod test {
         let timestamp_key = Ed25519PrivateKey::from_pkcs8(ED25519_4_PK8).unwrap();
 
         let root = RootMetadataBuilder::new()
-            .expires(Utc.ymd(2038, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2038, 1, 1, 0, 0, 0).unwrap())
             .root_key(root_key.public().clone())
             .snapshot_key(snapshot_key.public().clone())
             .targets_key(targets_key.public().clone())
@@ -3274,29 +3527,35 @@ mod test {
 
     fn make_snapshot() -> serde_json::Value {
         let snapshot = SnapshotMetadataBuilder::new()
-            .expires(Utc.ymd(2038, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2038, 1, 1, 0, 0, 0).unwrap())
             .build()
             .unwrap();
 
+        #[allow(clippy::needless_borrows_for_generic_args)]
         serde_json::to_value(&snapshot).unwrap()
     }
 
     fn make_timestamp() -> serde_json::Value {
-        let description =
-            MetadataDescription::from_slice(&[][..], 1, &[HashAlgorithm::Sha256]).unwrap();
+        let description = MetadataDescription::from_slice(
+            &[][..],
+            MetadataVersion::ONE,
+            &[HashAlgorithm::Sha256],
+        )
+        .unwrap();
 
         let timestamp = TimestampMetadataBuilder::from_metadata_description(description)
-            .expires(Utc.ymd(2017, 1, 1).and_hms(0, 0, 0))
+            .expires(Utc.with_ymd_and_hms(2017, 1, 1, 0, 0, 0).unwrap())
             .build()
             .unwrap();
 
+        #[allow(clippy::needless_borrows_for_generic_args)]
         serde_json::to_value(&timestamp).unwrap()
     }
 
     fn make_targets() -> serde_json::Value {
         let targets = TargetsMetadata::new(
-            1,
-            Utc.ymd(2038, 1, 1).and_hms(0, 0, 0),
+            MetadataVersion::ONE,
+            Utc.with_ymd_and_hms(2038, 1, 1, 0, 0, 0).unwrap(),
             hashmap!(),
             Delegations::default(),
             Default::default(),
@@ -3313,14 +3572,16 @@ mod test {
             .clone();
         let delegations = Delegations::new(
             hashmap! { key.key_id().clone() => key.clone() },
-            vec![Delegation::new(
-                MetadataPath::new("foo").unwrap(),
-                false,
-                1,
-                hashset!(key.key_id().clone()),
-                hashset!(TargetPath::new("bar").unwrap()),
-            )
-            .unwrap()],
+            vec![
+                Delegation::new(
+                    MetadataPath::new("foo").unwrap(),
+                    false,
+                    MetadataThreshold::ONE,
+                    hashset!(key.key_id().clone()),
+                    hashset!(TargetPath::new("bar").unwrap()),
+                )
+                .unwrap(),
+            ],
         )
         .unwrap();
 
@@ -3335,7 +3596,7 @@ mod test {
         let delegation = Delegation::new(
             MetadataPath::new("foo").unwrap(),
             false,
-            1,
+            MetadataThreshold::ONE,
             hashset!(key.key_id().clone()),
             hashset!(TargetPath::new("bar").unwrap()),
         )
@@ -3433,26 +3694,28 @@ mod test {
     // Refuse to deserialize role definitions with illegal thresholds
     #[test]
     fn deserialize_json_role_definition_illegal_threshold() {
-        let role_def = RoleDefinition::new(
-            1,
-            hashset![Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8)
-                .unwrap()
-                .public()
-                .key_id()
-                .clone()],
+        let role_def = RoleDefinition::<RootMetadata>::new(
+            MetadataThreshold::ONE,
+            hashset![
+                Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8)
+                    .unwrap()
+                    .public()
+                    .key_id()
+                    .clone()
+            ],
         )
         .unwrap();
 
         let mut jsn = serde_json::to_value(&role_def).unwrap();
         set_threshold(&mut jsn, 0);
-        assert!(serde_json::from_value::<RoleDefinition>(jsn).is_err());
+        assert!(serde_json::from_value::<RoleDefinition<RootMetadata>>(jsn).is_err());
 
         let mut jsn = serde_json::to_value(&role_def).unwrap();
         set_threshold(&mut jsn, -1);
-        assert!(serde_json::from_value::<RoleDefinition>(jsn).is_err());
+        assert!(serde_json::from_value::<RoleDefinition<RootMetadata>>(jsn).is_err());
 
-        let role_def = RoleDefinition::new(
-            2,
+        let role_def = RoleDefinition::<RootMetadata>::new(
+            MetadataThreshold::from(TWO),
             hashset![
                 Ed25519PrivateKey::from_pkcs8(ED25519_1_PK8)
                     .unwrap()
@@ -3470,7 +3733,7 @@ mod test {
 
         let mut jsn = serde_json::to_value(&role_def).unwrap();
         set_threshold(&mut jsn, 3);
-        assert!(serde_json::from_value::<RoleDefinition>(jsn).is_err());
+        assert!(serde_json::from_value::<RoleDefinition<RootMetadata>>(jsn).is_err());
     }
 
     // Refuse to deserialize root metadata with wrong type field
@@ -3503,7 +3766,9 @@ mod test {
             .public()
             .key_id()
             .clone();
-        let role_def = RoleDefinition::new(1, hashset![key_id.clone()]).unwrap();
+        let role_def =
+            RoleDefinition::<RootMetadata>::new(MetadataThreshold::ONE, hashset![key_id.clone()])
+                .unwrap();
         let mut jsn = serde_json::to_value(&role_def).unwrap();
 
         match jsn.as_object_mut() {
@@ -3514,7 +3779,7 @@ mod test {
             None => panic!(),
         }
 
-        assert!(serde_json::from_value::<RoleDefinition>(jsn).is_err());
+        assert!(serde_json::from_value::<RoleDefinition<RootMetadata>>(jsn).is_err());
     }
 
     // Refuse to deserialize snapshot metadata with illegal versions
@@ -3659,64 +3924,6 @@ mod test {
         assert!(serde_json::from_value::<TargetsMetadata>(targets).is_err());
     }
 
-    // Accept targets metadata with a version that does not fit in a u32.
-    #[test]
-    fn deserialize_json_targets_u64_version() {
-        let big_version: u64 = u32::MAX as u64 + 1;
-
-        let mut targets = make_targets();
-        targets
-            .as_object_mut()
-            .unwrap()
-            .insert("version".into(), json!(big_version));
-
-        let decoded: TargetsMetadata = serde_json::from_value(targets.clone()).unwrap();
-        assert_eq!(decoded.version(), big_version);
-
-        // Round-tripping preserves the large version.
-        let reencoded = serde_json::to_value(&decoded).unwrap();
-        assert_eq!(reencoded, targets);
-    }
-
-    // Accept targets metadata with the maximum u64 version.
-    #[test]
-    fn deserialize_json_targets_u64_max_version() {
-        let mut targets = make_targets();
-        targets
-            .as_object_mut()
-            .unwrap()
-            .insert("version".into(), json!(u64::MAX));
-
-        let decoded: TargetsMetadata = serde_json::from_value(targets).unwrap();
-        assert_eq!(decoded.version(), u64::MAX);
-    }
-
-    // Accept snapshot metadata whose meta descriptions reference targets
-    // versions that do not fit in a u32.
-    #[test]
-    fn deserialize_json_snapshot_meta_u64_version() {
-        let big_version: u64 = u32::MAX as u64 + 42;
-
-        let snapshot_json = json!({
-            "_type": "snapshot",
-            "spec_version": "1.0.0",
-            "version": 1u64,
-            "expires": "2038-01-01T00:00:00Z",
-            "meta": {
-                "targets.json": {
-                    "version": big_version,
-                }
-            }
-        });
-
-        let decoded: SnapshotMetadata = serde_json::from_value(snapshot_json).unwrap();
-        let description = decoded
-            .meta()
-            .get(&MetadataPath::targets())
-            .expect("targets description");
-        assert_eq!(description.version(), big_version);
-    }
-
     // Refuse to deserialize targets metadata with wrong type field
     #[test]
     fn deserialize_json_targets_bad_type() {
@@ -3737,6 +3944,26 @@ mod test {
             .unwrap()
             .insert("spec_version".into(), json!("0"));
         assert!(serde_json::from_value::<TargetsMetadata>(targets).is_err());
+    }
+
+    #[test]
+    fn deserialize_json_root_accepts_1_0_x_spec_version() {
+        let mut root = make_root();
+        let _ = root
+            .as_object_mut()
+            .unwrap()
+            .insert("spec_version".into(), json!("1.0.31"));
+        assert!(serde_json::from_value::<RootMetadata>(root).is_ok());
+    }
+
+    #[test]
+    fn deserialize_json_root_accepts_legacy_1_0_spec_version() {
+        let mut root = make_root();
+        let _ = root
+            .as_object_mut()
+            .unwrap()
+            .insert("spec_version".into(), json!("1.0"));
+        assert!(serde_json::from_value::<RootMetadata>(root).is_ok());
     }
 
     // Refuse to deserialize delegations with duplicated roles

@@ -1,9 +1,14 @@
 //! Error types and converters.
 
-use std::io;
-use thiserror::Error;
-
-use crate::metadata::{MetadataPath, MetadataVersion, TargetPath};
+use {
+    crate::{
+        crypto::KeyId,
+        metadata::{MetadataPath, MetadataThreshold, MetadataVersion, TargetPath},
+    },
+    chrono::{DateTime, offset::Utc},
+    std::io,
+    thiserror::Error,
+};
 
 /// Alias for `Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -21,15 +26,22 @@ pub enum Error {
     Encoding(String),
 
     /// Metadata was expired.
-    #[error("expired {0} metadata")]
-    ExpiredMetadata(MetadataPath),
+    #[error("metadata {path} expired at {expiration}, it is now {now}")]
+    ExpiredMetadata {
+        /// The metadata that expired.
+        path: MetadataPath,
+        /// When the metadata expired.
+        expiration: DateTime<Utc>,
+        /// The latest known time.
+        now: DateTime<Utc>,
+    },
 
     /// An illegal argument was passed into a function.
     #[error("illegal argument: {0}")]
     IllegalArgument(String),
 
     /// Generic error for HTTP connections.
-    #[cfg(feature = "hyper")]
+    #[cfg(feature = "http")]
     #[error("http error for {uri}")]
     Http {
         /// URI Resource that resulted in the error.
@@ -40,20 +52,19 @@ pub enum Error {
         err: http::Error,
     },
 
-    /// Errors that can occur parsing HTTP streams.
-    #[cfg(feature = "hyper")]
-    #[error("hyper error for {uri}")]
-    Hyper {
+    /// Error occurring in a repository backend (e.g., HTTP, custom transport).
+    #[error("repository backend error for {uri}")]
+    Repository {
         /// URI Resource that resulted in the error.
         uri: String,
 
         /// The error.
         #[source]
-        err: hyper::Error,
+        err: Box<dyn std::error::Error + Send + Sync + 'static>,
     },
 
     /// Unexpected HTTP response status.
-    #[cfg(feature = "hyper")]
+    #[cfg(feature = "http")]
     #[error("error getting {uri}: request failed with status code {code}")]
     BadHttpStatus {
         /// URI Resource that resulted in the error.
@@ -87,13 +98,13 @@ pub enum Error {
     NoSupportedHashAlgorithm,
 
     /// The metadata was not found.
-    #[error("metadata {path} at version {version} not found")]
+    #[error("metadata {path} at version {version:?} not found")]
     MetadataNotFound {
         /// The metadata path.
         path: MetadataPath,
 
         /// The metadata version.
-        version: MetadataVersion,
+        version: Option<MetadataVersion>,
     },
 
     /// The target was not found.
@@ -113,13 +124,29 @@ pub enum Error {
     #[error("unknown signature scheme: {0}")]
     UnknownSignatureScheme(String),
 
-    /// The metadata threshold cannot equal 0.
-    #[error("metadata {0} threshold must be greater than zero")]
-    MetadataThresholdMustBeGreaterThanZero(MetadataPath),
-
     /// The metadata's version must be less than `u64::MAX`.
     #[error("metadata {0} version should be less than max u64")]
     MetadataVersionMustBeSmallerThanMaxU64(MetadataPath),
+
+    /// The metadata role has a duplicate keyid.
+    #[error("metadata role {role} has duplicate key id {key_id}")]
+    MetadataRoleHasDuplicateKeyId {
+        /// The metadata.
+        role: MetadataPath,
+        /// The duplicated keyid.
+        key_id: KeyId,
+    },
+
+    /// The metadata role does not have enough keyids.
+    #[error("metadata role {role} has {key_ids} keyid(s), must have at least {threshold}")]
+    MetadataRoleDoesNotHaveEnoughKeyIds {
+        /// The metadata.
+        role: MetadataPath,
+        /// The number of keyids.
+        key_ids: usize,
+        /// The minimum threshold of keys.
+        threshold: MetadataThreshold,
+    },
 
     /// The metadata was not signed with enough valid signatures.
     #[error(
@@ -131,7 +158,7 @@ pub enum Error {
         /// The number of signatures which are valid.
         number_of_valid_signatures: u32,
         /// The minimum number of valid signatures.
-        threshold: u32,
+        threshold: MetadataThreshold,
     },
 
     /// Attempted to update metadata with an older version.
@@ -142,23 +169,25 @@ pub enum Error {
         /// The metadata.
         role: MetadataPath,
         /// The trusted metadata's version.
-        trusted_version: u64,
+        trusted_version: MetadataVersion,
         /// The new metadata's version.
-        new_version: u64,
+        new_version: MetadataVersion,
     },
 
     /// The parent metadata expected the child metadata to be at one version, but was found to be at
     /// another version.
-    #[error("metadata {parent_role} expected metadata {child_role} version {expected_version}, but found {new_version}")]
+    #[error(
+        "metadata {parent_role} expected metadata {child_role} version {expected_version}, but found {new_version}"
+    )]
     WrongMetadataVersion {
         /// The parent metadata that contains the child metadata's version.
         parent_role: MetadataPath,
         /// The child metadata that has an unexpected version.
         child_role: MetadataPath,
         /// The expected version of the child metadata.
-        expected_version: u64,
+        expected_version: MetadataVersion,
         /// The actual version of the child metadata.
-        new_version: u64,
+        new_version: MetadataVersion,
     },
 
     /// The parent metadata does not contain a description of the child metadata.
@@ -178,8 +207,55 @@ pub enum Error {
         /// That child metadata that was not delegated to by the parent.
         child_role: MetadataPath,
     },
+
+    /// The metadata must be signed with at least one private key.
+    #[error("{role} must be signed with at least one private key")]
+    MissingPrivateKey {
+        /// The metadata to be signed.
+        role: MetadataPath,
+    },
 }
 
-pub(crate) fn derp_error_to_error(err: derp::Error) -> Error {
-    Error::Encoding(format!("DER: {:?}", err))
+#[cfg(test)]
+mod test {
+    use super::*;
+    use std::error::Error as StdError;
+    use std::fmt;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CustomServiceError {
+        code: u32,
+    }
+
+    impl fmt::Display for CustomServiceError {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "custom service error code {}", self.code)
+        }
+    }
+
+    impl StdError for CustomServiceError {}
+
+    #[test]
+    fn repository_error_source_and_downcast() {
+        let inner = CustomServiceError { code: 404 };
+        let err = Error::Repository {
+            uri: "https://example.com/repo".to_string(),
+            err: Box::new(inner),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "repository backend error for https://example.com/repo"
+        );
+
+        let source = err
+            .source()
+            .expect("Error::Backend should provide a source");
+        assert_eq!(source.to_string(), "custom service error code 404");
+
+        let downcasted = source
+            .downcast_ref::<CustomServiceError>()
+            .expect("should downcast cleanly to CustomServiceError");
+        assert_eq!(downcasted, &CustomServiceError { code: 404 });
+    }
 }

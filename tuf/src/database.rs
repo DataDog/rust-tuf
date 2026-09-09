@@ -1,40 +1,40 @@
 //! Components needed to verify TUF metadata and targets.
 
-use chrono::{offset::Utc, DateTime};
+use chrono::{DateTime, offset::Utc};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 
+use crate::Result;
 use crate::crypto::PublicKey;
 use crate::error::Error;
-use crate::interchange::DataInterchange;
 use crate::metadata::{
-    Delegations, Metadata, MetadataPath, MetadataVersion, RawSignedMetadata, RawSignedMetadataSet,
-    RootMetadata, SnapshotMetadata, TargetDescription, TargetPath, TargetsMetadata,
-    TimestampMetadata,
+    Delegations, Metadata, MetadataPath, MetadataThreshold, MetadataVersion, RawSignedMetadata,
+    RawSignedMetadataSet, RootMetadata, SnapshotMetadata, TargetDescription, TargetPath,
+    TargetsMetadata, TimestampMetadata,
 };
+use crate::pouf::Pouf;
 use crate::verify::{self, Verified};
-use crate::Result;
 
 /// Contains trusted TUF metadata and can be used to verify other metadata and targets.
-#[derive(Clone, Debug)]
-pub struct Database<D: DataInterchange> {
+#[derive(Debug)]
+pub struct Database<D: Pouf> {
     trusted_root: Verified<RootMetadata>,
-    trusted_snapshot: Option<Verified<SnapshotMetadata>>,
     trusted_targets: Option<Verified<TargetsMetadata>>,
+    trusted_snapshot: Option<Verified<SnapshotMetadata>>,
     trusted_timestamp: Option<Verified<TimestampMetadata>>,
     trusted_delegations: HashMap<MetadataPath, Verified<TargetsMetadata>>,
-    interchange: PhantomData<D>,
+    pouf: PhantomData<D>,
 }
 
-impl<D: DataInterchange> Database<D> {
+impl<D: Pouf> Database<D> {
     /// Create a new [`Database`] struct from a set of trusted root keys that are used to verify
     /// the signed metadata. The signed root metadata must be signed with at least a
     /// `root_threshold` of the provided root_keys. It is not necessary for the root metadata to
     /// contain these keys.
     pub fn from_root_with_trusted_keys<'a, I>(
         raw_root: &RawSignedMetadata<D, RootMetadata>,
-        root_threshold: u32,
+        root_threshold: MetadataThreshold,
         root_keys: I,
     ) -> Result<Self>
     where
@@ -70,7 +70,7 @@ impl<D: DataInterchange> Database<D> {
             trusted_targets: None,
             trusted_timestamp: None,
             trusted_delegations: HashMap::new(),
-            interchange: PhantomData,
+            pouf: PhantomData,
         })
     }
 
@@ -102,7 +102,7 @@ impl<D: DataInterchange> Database<D> {
             trusted_targets: None,
             trusted_timestamp: None,
             trusted_delegations: HashMap::new(),
-            interchange: PhantomData,
+            pouf: PhantomData,
         })
     }
 
@@ -111,7 +111,7 @@ impl<D: DataInterchange> Database<D> {
     /// of the provided root_keys. It is not necessary for the root metadata to contain these keys.
     pub fn from_metadata_with_trusted_keys<'a, I>(
         metadata_set: &RawSignedMetadataSet<D>,
-        root_threshold: u32,
+        root_threshold: MetadataThreshold,
         root_keys: I,
     ) -> Result<Self>
     where
@@ -131,7 +131,7 @@ impl<D: DataInterchange> Database<D> {
     pub fn from_metadata_with_trusted_keys_and_start_time<'a, I>(
         start_time: &DateTime<Utc>,
         metadata_set: &RawSignedMetadataSet<D>,
-        root_threshold: u32,
+        root_threshold: MetadataThreshold,
         root_keys: I,
     ) -> Result<Self>
     where
@@ -142,7 +142,7 @@ impl<D: DataInterchange> Database<D> {
         } else {
             return Err(Error::MetadataNotFound {
                 path: MetadataPath::root(),
-                version: MetadataVersion::None,
+                version: None,
             });
         };
 
@@ -178,7 +178,7 @@ impl<D: DataInterchange> Database<D> {
         } else {
             return Err(Error::MetadataNotFound {
                 path: MetadataPath::root(),
-                version: MetadataVersion::None,
+                version: None,
             });
         };
 
@@ -424,15 +424,13 @@ impl<D: DataInterchange> Database<D> {
             //     new timestamp metadata file. If not, discard the new timestamp metadadata file,
             //     abort the update cycle, and report the failure.
 
-            // FIXME(#294): Implement this section.
-
-            /////////////////////////////////////////
-            // FIXME(#297): forgetting the trusted snapshot here is not part of the spec. Do we need to
-            // do it?
-
-            if let Some(trusted_snapshot) = &self.trusted_snapshot {
-                if trusted_snapshot.version() != new_timestamp.snapshot().version() {
-                    self.trusted_snapshot = None;
+            if let Some(trusted_timestamp) = &self.trusted_timestamp {
+                if new_timestamp.snapshot().version() < trusted_timestamp.snapshot().version() {
+                    return Err(Error::AttemptedMetadataRollBack {
+                        role: MetadataPath::snapshot(),
+                        trusted_version: trusted_timestamp.snapshot().version(),
+                        new_version: new_timestamp.snapshot().version(),
+                    });
                 }
             }
 
@@ -446,7 +444,11 @@ impl<D: DataInterchange> Database<D> {
             //     report the potential freeze attack.
 
             if new_timestamp.expires() <= start_time {
-                return Err(Error::ExpiredMetadata(MetadataPath::timestamp()));
+                return Err(Error::ExpiredMetadata {
+                    path: MetadataPath::timestamp(),
+                    expiration: *new_timestamp.expires(),
+                    now: *start_time,
+                });
             }
 
             new_timestamp
@@ -566,7 +568,24 @@ impl<D: DataInterchange> Database<D> {
             //     metadata file. If any of these conditions are not met, discard the new snapshot
             //     metadadata file, abort the update cycle, and report the failure.
 
-            // FIXME(#295): Implement this section.
+            if let Some(trusted_snapshot) = &self.trusted_snapshot {
+                for (role, trusted_description) in trusted_snapshot.meta().iter() {
+                    let new_description = new_snapshot.meta().get(role).ok_or_else(|| {
+                        Error::MissingMetadataDescription {
+                            parent_role: MetadataPath::snapshot(),
+                            child_role: role.clone(),
+                        }
+                    })?;
+
+                    if new_description.version() < trusted_description.version() {
+                        return Err(Error::AttemptedMetadataRollBack {
+                            role: role.clone(),
+                            trusted_version: trusted_description.version(),
+                            new_version: new_description.version(),
+                        });
+                    }
+                }
+            }
 
             /////////////////////////////////////////
             // TUF-1.0.5 §5.3.4:
@@ -586,16 +605,11 @@ impl<D: DataInterchange> Database<D> {
         };
 
         // FIXME(#297): purging targets is not part of the spec. Do we need to do it?
-        if self
-            .trusted_targets
-            .as_ref()
-            .map(|s| s.version())
-            .unwrap_or(0)
+        if self.trusted_targets.as_ref().map(|s| s.version())
             != verified
                 .meta()
                 .get(&MetadataPath::targets())
                 .map(|m| m.version())
-                .unwrap_or(0)
         {
             self.trusted_targets = None;
         }
@@ -720,9 +734,9 @@ impl<D: DataInterchange> Database<D> {
         start_time: &DateTime<Utc>,
         role: &MetadataPath,
         raw_targets: &RawSignedMetadata<D, TargetsMetadata>,
-        trusted_targets_threshold: u32,
+        trusted_targets_threshold: MetadataThreshold,
         trusted_targets_keys: impl Iterator<Item = &'a PublicKey>,
-        trusted_targets_version: Option<u64>,
+        trusted_targets_version: Option<MetadataVersion>,
     ) -> Result<Option<Verified<TargetsMetadata>>> {
         // FIXME(https://github.com/theupdateframework/specification/issues/113) Checking if
         // this metadata expired isn't part of the spec. Do we actually want to do this?
@@ -811,7 +825,11 @@ impl<D: DataInterchange> Database<D> {
         //     potential freeze attack.
 
         if new_targets.expires() <= start_time {
-            return Err(Error::ExpiredMetadata(role.clone()));
+            return Err(Error::ExpiredMetadata {
+                path: role.clone(),
+                expiration: *new_targets.expires(),
+                now: *start_time,
+            });
         }
 
         Ok(Some(new_targets))
@@ -823,7 +841,7 @@ impl<D: DataInterchange> Database<D> {
         &self,
         parent_role: &MetadataPath,
         role: &MetadataPath,
-    ) -> Result<Option<(u32, Vec<&PublicKey>)>> {
+    ) -> Result<Option<(MetadataThreshold, Vec<&PublicKey>)>> {
         // Find the parent TargetsMetadata that is expected to refer to `role`.
         let trusted_parent = if parent_role == &MetadataPath::targets() {
             if let Some(trusted_targets) = self.trusted_targets() {
@@ -831,7 +849,7 @@ impl<D: DataInterchange> Database<D> {
             } else {
                 return Err(Error::MetadataNotFound {
                     path: parent_role.clone(),
-                    version: MetadataVersion::None,
+                    version: None,
                 });
             }
         } else if let Some(trusted_parent) = self.trusted_delegations.get(parent_role) {
@@ -839,7 +857,7 @@ impl<D: DataInterchange> Database<D> {
         } else {
             return Err(Error::MetadataNotFound {
                 path: parent_role.clone(),
-                version: MetadataVersion::None,
+                version: None,
             });
         };
 
@@ -895,7 +913,7 @@ impl<D: DataInterchange> Database<D> {
             return Ok(d.clone());
         }
 
-        fn lookup<'a, D: DataInterchange>(
+        fn lookup<'a, D: Pouf>(
             start_time: &DateTime<Utc>,
             tuf: &'a Database<D>,
             default_terminate: bool,
@@ -977,19 +995,10 @@ impl<D: DataInterchange> Database<D> {
         }
     }
 
-    /// Clear all trusted non-root metadata (snapshot, targets, timestamp, and
-    /// delegated targets) while preserving the currently trusted root — including
-    /// any newer root version reached via [`Database::update_root`] chaining.
+    /// Clear trusted non-root metadata while preserving the current trusted root.
     ///
-    /// This is the same operation performed internally after a successful root
-    /// rotation per TUF-1.0.5 §5.1.9 to recover from fast-forward attacks. It is
-    /// exposed so callers can drop potentially-poisoned derived metadata (e.g.
-    /// after a mid-update failure) without discarding the advanced trusted root
-    /// and being forced to restart chaining from an embedded/bundled root.
-    ///
-    /// Only in-memory verified state on the [`Database`] is affected; any local
-    /// or remote repository caches held by a [`crate::client::Client`] are not
-    /// touched by this method.
+    /// This drops snapshot, targets, timestamp, and delegated targets state. Repository storage
+    /// is not affected.
     pub fn purge_metadata(&mut self) {
         self.trusted_snapshot = None;
         self.trusted_targets = None;
@@ -1000,7 +1009,11 @@ impl<D: DataInterchange> Database<D> {
     fn trusted_root_unexpired(&self, start_time: &DateTime<Utc>) -> Result<&RootMetadata> {
         let trusted_root = &self.trusted_root;
         if trusted_root.expires() <= start_time {
-            return Err(Error::ExpiredMetadata(MetadataPath::root()));
+            return Err(Error::ExpiredMetadata {
+                path: MetadataPath::root(),
+                expiration: *trusted_root.expires(),
+                now: *start_time,
+            });
         }
         Ok(trusted_root)
     }
@@ -1012,13 +1025,17 @@ impl<D: DataInterchange> Database<D> {
         match self.trusted_timestamp {
             Some(ref trusted_timestamp) => {
                 if trusted_timestamp.expires() <= start_time {
-                    return Err(Error::ExpiredMetadata(MetadataPath::timestamp()));
+                    return Err(Error::ExpiredMetadata {
+                        path: MetadataPath::timestamp(),
+                        expiration: *trusted_timestamp.expires(),
+                        now: *start_time,
+                    });
                 }
                 Ok(trusted_timestamp)
             }
             None => Err(Error::MetadataNotFound {
                 path: MetadataPath::timestamp(),
-                version: MetadataVersion::None,
+                version: None,
             }),
         }
     }
@@ -1027,13 +1044,17 @@ impl<D: DataInterchange> Database<D> {
         match self.trusted_snapshot {
             Some(ref trusted_snapshot) => {
                 if trusted_snapshot.expires() <= start_time {
-                    return Err(Error::ExpiredMetadata(MetadataPath::snapshot()));
+                    return Err(Error::ExpiredMetadata {
+                        path: MetadataPath::snapshot(),
+                        expiration: *trusted_snapshot.expires(),
+                        now: *start_time,
+                    });
                 }
                 Ok(trusted_snapshot)
             }
             None => Err(Error::MetadataNotFound {
                 path: MetadataPath::snapshot(),
-                version: MetadataVersion::None,
+                version: None,
             }),
         }
     }
@@ -1042,14 +1063,31 @@ impl<D: DataInterchange> Database<D> {
         match self.trusted_targets {
             Some(ref trusted_targets) => {
                 if trusted_targets.expires() <= start_time {
-                    return Err(Error::ExpiredMetadata(MetadataPath::targets()));
+                    return Err(Error::ExpiredMetadata {
+                        path: MetadataPath::targets(),
+                        expiration: *trusted_targets.expires(),
+                        now: *start_time,
+                    });
                 }
                 Ok(trusted_targets)
             }
             None => Err(Error::MetadataNotFound {
                 path: MetadataPath::targets(),
-                version: MetadataVersion::None,
+                version: None,
             }),
+        }
+    }
+}
+
+impl<D: Pouf> Clone for Database<D> {
+    fn clone(&self) -> Self {
+        Self {
+            trusted_root: self.trusted_root.clone(),
+            trusted_targets: self.trusted_targets.clone(),
+            trusted_snapshot: self.trusted_snapshot.clone(),
+            trusted_timestamp: self.trusted_timestamp.clone(),
+            trusted_delegations: self.trusted_delegations.clone(),
+            pouf: PhantomData,
         }
     }
 }
@@ -1058,30 +1096,32 @@ impl<D: DataInterchange> Database<D> {
 mod test {
     use super::*;
     use crate::crypto::{Ed25519PrivateKey, HashAlgorithm, PrivateKey};
-    use crate::interchange::Json;
     use crate::metadata::{
         RawSignedMetadataSetBuilder, RootMetadataBuilder, SnapshotMetadataBuilder,
         TargetsMetadataBuilder, TimestampMetadataBuilder,
     };
+    use crate::pouf::Pouf1;
     use assert_matches::assert_matches;
-    use lazy_static::lazy_static;
     use std::iter::once;
+    use std::num::NonZeroU32;
+    use std::sync::LazyLock;
 
-    lazy_static! {
-        static ref KEYS: Vec<Ed25519PrivateKey> = {
-            let keys: &[&[u8]] = &[
-                include_bytes!("../tests/ed25519/ed25519-1.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-2.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-3.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-4.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-5.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-6.pk8.der"),
-            ];
-            keys.iter()
-                .map(|b| Ed25519PrivateKey::from_pkcs8(b).unwrap())
-                .collect()
-        };
-    }
+    const ONE: NonZeroU32 = NonZeroU32::new(1).unwrap();
+    const TWO: NonZeroU32 = NonZeroU32::new(2).unwrap();
+
+    static KEYS: LazyLock<Vec<Ed25519PrivateKey>> = LazyLock::new(|| {
+        let keys: &[&[u8]] = &[
+            include_bytes!("../tests/ed25519/ed25519-1.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-2.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-3.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-4.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-5.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-6.pk8.der"),
+        ];
+        keys.iter()
+            .map(|b| Ed25519PrivateKey::from_pkcs8(b).unwrap())
+            .collect()
+    });
 
     #[test]
     fn root_trusted_keys_success() {
@@ -1090,12 +1130,16 @@ mod test {
             .snapshot_key(KEYS[0].public().clone())
             .targets_key(KEYS[0].public().clone())
             .timestamp_key(KEYS[0].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap();
         let raw_root = root.to_raw().unwrap();
 
         assert_matches!(
-            Database::from_root_with_trusted_keys(&raw_root, 1, once(KEYS[0].public())),
+            Database::from_root_with_trusted_keys(
+                &raw_root,
+                MetadataThreshold::ONE,
+                once(KEYS[0].public())
+            ),
             Ok(_)
         );
     }
@@ -1107,16 +1151,16 @@ mod test {
             .snapshot_key(KEYS[0].public().clone())
             .targets_key(KEYS[0].public().clone())
             .timestamp_key(KEYS[0].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap();
         let raw_root = root.to_raw().unwrap();
 
         assert_matches!(
-            Database::from_root_with_trusted_keys(&raw_root, 1, once(KEYS[1].public())),
+            Database::from_root_with_trusted_keys(&raw_root, MetadataThreshold::ONE, once(KEYS[1].public())),
             Err(Error::MetadataMissingSignatures {
                 role,
                 number_of_valid_signatures: 0,
-                threshold: 1,
+                threshold: MetadataThreshold::ONE,
             })
             if role == MetadataPath::root()
         );
@@ -1129,7 +1173,7 @@ mod test {
             .snapshot_key(KEYS[0].public().clone())
             .targets_key(KEYS[0].public().clone())
             .timestamp_key(KEYS[0].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1146,7 +1190,7 @@ mod test {
             .snapshot_key(KEYS[0].public().clone())
             .targets_key(KEYS[0].public().clone())
             .timestamp_key(KEYS[0].public().clone())
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1158,7 +1202,7 @@ mod test {
             Err(Error::MetadataMissingSignatures {
                 role,
                 number_of_valid_signatures: 0,
-                threshold: 1,
+                threshold: MetadataThreshold::ONE,
             })
             if role == MetadataPath::root()
         );
@@ -1171,7 +1215,7 @@ mod test {
             .snapshot_key(KEYS[0].public().clone())
             .targets_key(KEYS[0].public().clone())
             .timestamp_key(KEYS[0].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1179,7 +1223,11 @@ mod test {
         let metadata = RawSignedMetadataSetBuilder::new().root(root).build();
 
         assert_matches!(
-            Database::from_metadata_with_trusted_keys(&metadata, 1, once(KEYS[0].public())),
+            Database::from_metadata_with_trusted_keys(
+                &metadata,
+                MetadataThreshold::ONE,
+                once(KEYS[0].public())
+            ),
             Ok(_)
         );
     }
@@ -1191,7 +1239,7 @@ mod test {
             .snapshot_key(KEYS[0].public().clone())
             .targets_key(KEYS[0].public().clone())
             .timestamp_key(KEYS[0].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1199,11 +1247,11 @@ mod test {
         let metadata = RawSignedMetadataSetBuilder::new().root(root).build();
 
         assert_matches!(
-            Database::from_metadata_with_trusted_keys(&metadata, 1, once(KEYS[1].public())),
+            Database::from_metadata_with_trusted_keys(&metadata, MetadataThreshold::ONE, once(KEYS[1].public())),
             Err(Error::MetadataMissingSignatures {
                 role,
                 number_of_valid_signatures: 0,
-                threshold: 1,
+                threshold: MetadataThreshold::ONE,
             })
             if role == MetadataPath::root()
         );
@@ -1216,7 +1264,7 @@ mod test {
             .snapshot_key(KEYS[0].public().clone())
             .targets_key(KEYS[0].public().clone())
             .timestamp_key(KEYS[0].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1224,12 +1272,12 @@ mod test {
         let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
 
         let mut root = RootMetadataBuilder::new()
-            .version(2)
+            .version(TWO)
             .root_key(KEYS[1].public().clone())
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[1].public().clone())
             .timestamp_key(KEYS[1].public().clone())
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
 
         // add the original key's signature to make it cross signed
@@ -1241,8 +1289,14 @@ mod test {
         // second update with the same metadata should fail.
         assert_matches!(
             tuf.update_root(&raw_root),
-            Err(Error::AttemptedMetadataRollBack { role, trusted_version: 2, new_version: 2 })
+            Err(Error::AttemptedMetadataRollBack {
+                role,
+                trusted_version,
+                new_version,
+            })
             if role == MetadataPath::root()
+                && trusted_version == TWO.into()
+                && new_version == TWO.into()
         );
     }
 
@@ -1253,7 +1307,7 @@ mod test {
             .snapshot_key(KEYS[0].public().clone())
             .targets_key(KEYS[0].public().clone())
             .timestamp_key(KEYS[0].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1265,7 +1319,7 @@ mod test {
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[1].public().clone())
             .timestamp_key(KEYS[1].public().clone())
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1282,7 +1336,7 @@ mod test {
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[1].public().clone())
             .timestamp_key(KEYS[1].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1290,13 +1344,13 @@ mod test {
         let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
 
         let snapshot = SnapshotMetadataBuilder::new()
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
 
         let timestamp =
             TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .signed::<Json>(&KEYS[1])
+                .signed::<Pouf1>(&KEYS[1])
                 .unwrap();
         let raw_timestamp = timestamp.to_raw().unwrap();
 
@@ -1318,7 +1372,7 @@ mod test {
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[1].public().clone())
             .timestamp_key(KEYS[1].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1326,19 +1380,78 @@ mod test {
         let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
 
         let snapshot = SnapshotMetadataBuilder::new()
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
 
         let raw_timestamp =
             TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
                 .unwrap()
                 // sign it with the root key
-                .signed::<Json>(&KEYS[0])
+                .signed::<Pouf1>(&KEYS[0])
                 .unwrap()
                 .to_raw()
                 .unwrap();
 
         assert!(tuf.update_timestamp(&now, &raw_timestamp).is_err())
+    }
+
+    #[test]
+    fn bad_timestamp_update_rollback_snapshot() {
+        let now = Utc::now();
+
+        let raw_root = RootMetadataBuilder::new()
+            .root_key(KEYS[0].public().clone())
+            .snapshot_key(KEYS[1].public().clone())
+            .targets_key(KEYS[1].public().clone())
+            .timestamp_key(KEYS[1].public().clone())
+            .signed::<Pouf1>(&KEYS[0])
+            .unwrap()
+            .to_raw()
+            .unwrap();
+
+        let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
+
+        let snapshot_v2 = SnapshotMetadataBuilder::new()
+            .version(TWO)
+            .signed::<Pouf1>(&KEYS[1])
+            .unwrap();
+
+        let raw_timestamp_v1 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot_v2, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(ONE)
+                .signed::<Pouf1>(&KEYS[1])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        tuf.update_timestamp(&now, &raw_timestamp_v1).unwrap();
+
+        let snapshot_v1 = SnapshotMetadataBuilder::new()
+            .version(ONE)
+            .signed::<Pouf1>(&KEYS[1])
+            .unwrap();
+
+        let raw_timestamp_v2 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot_v1, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(TWO)
+                .signed::<Pouf1>(&KEYS[1])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        assert_matches!(
+            tuf.update_timestamp(&now, &raw_timestamp_v2),
+            Err(Error::AttemptedMetadataRollBack {
+                role,
+                trusted_version,
+                new_version,
+            })
+            if role == MetadataPath::snapshot()
+                && trusted_version == TWO.into()
+                && new_version == MetadataVersion::ONE
+        );
     }
 
     #[test]
@@ -1350,7 +1463,7 @@ mod test {
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[2].public().clone())
             .timestamp_key(KEYS[2].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1363,7 +1476,7 @@ mod test {
         let raw_timestamp =
             TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .signed::<Json>(&KEYS[2])
+                .signed::<Pouf1>(&KEYS[2])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1385,7 +1498,7 @@ mod test {
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[2].public().clone())
             .timestamp_key(KEYS[2].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1393,7 +1506,7 @@ mod test {
         let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
 
         let snapshot = SnapshotMetadataBuilder::new()
-            .signed::<Json>(&KEYS[2])
+            .signed::<Pouf1>(&KEYS[2])
             .unwrap();
         let raw_snapshot = snapshot.to_raw().unwrap();
 
@@ -1401,7 +1514,7 @@ mod test {
             TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
                 .unwrap()
                 // sign it with the targets key
-                .signed::<Json>(&KEYS[2])
+                .signed::<Pouf1>(&KEYS[2])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1420,7 +1533,7 @@ mod test {
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[2].public().clone())
             .timestamp_key(KEYS[2].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1428,14 +1541,14 @@ mod test {
         let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
 
         let snapshot = SnapshotMetadataBuilder::new()
-            .version(2)
-            .signed::<Json>(&KEYS[2])
+            .version(TWO)
+            .signed::<Pouf1>(&KEYS[2])
             .unwrap();
 
         let raw_timestamp =
             TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .signed::<Json>(&KEYS[2])
+                .signed::<Pouf1>(&KEYS[2])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1443,13 +1556,247 @@ mod test {
         tuf.update_timestamp(&now, &raw_timestamp).unwrap();
 
         let raw_snapshot = SnapshotMetadataBuilder::new()
-            .version(1)
-            .signed::<Json>(&KEYS[1])
+            .version(ONE)
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap()
             .to_raw()
             .unwrap();
 
         assert!(tuf.update_snapshot(&now, &raw_snapshot).is_err());
+    }
+
+    #[test]
+    fn bad_snapshot_update_rollback_targets() {
+        let now = Utc::now();
+
+        let raw_root = RootMetadataBuilder::new()
+            .root_key(KEYS[0].public().clone())
+            .snapshot_key(KEYS[1].public().clone())
+            .targets_key(KEYS[2].public().clone())
+            .timestamp_key(KEYS[3].public().clone())
+            .signed::<Pouf1>(&KEYS[0])
+            .unwrap()
+            .to_raw()
+            .unwrap();
+
+        let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
+
+        let signed_targets_v2 = TargetsMetadataBuilder::new()
+            .version(TWO)
+            .signed::<Pouf1>(&KEYS[2])
+            .unwrap();
+
+        let snapshot_v1 = SnapshotMetadataBuilder::new()
+            .version(ONE)
+            .insert_metadata(&signed_targets_v2, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Pouf1>(&KEYS[1])
+            .unwrap();
+        let raw_snapshot_v1 = snapshot_v1.to_raw().unwrap();
+
+        let raw_timestamp_v1 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot_v1, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(ONE)
+                .signed::<Pouf1>(&KEYS[3])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        tuf.update_timestamp(&now, &raw_timestamp_v1).unwrap();
+        tuf.update_snapshot(&now, &raw_snapshot_v1).unwrap();
+
+        let signed_targets_v1 = TargetsMetadataBuilder::new()
+            .version(ONE)
+            .signed::<Pouf1>(&KEYS[2])
+            .unwrap();
+
+        let snapshot_v2 = SnapshotMetadataBuilder::new()
+            .version(TWO)
+            .insert_metadata(&signed_targets_v1, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Pouf1>(&KEYS[1])
+            .unwrap();
+        let raw_snapshot_v2 = snapshot_v2.to_raw().unwrap();
+
+        let raw_timestamp_v2 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot_v2, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(TWO)
+                .signed::<Pouf1>(&KEYS[3])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        tuf.update_timestamp(&now, &raw_timestamp_v2).unwrap();
+
+        assert_matches!(
+            tuf.update_snapshot(&now, &raw_snapshot_v2),
+            Err(Error::AttemptedMetadataRollBack {
+                role,
+                trusted_version,
+                new_version,
+            })
+            if role == MetadataPath::targets()
+                && trusted_version == TWO.into()
+                && new_version == MetadataVersion::ONE
+        );
+    }
+
+    #[test]
+    fn bad_snapshot_update_missing_targets() {
+        let now = Utc::now();
+
+        let raw_root = RootMetadataBuilder::new()
+            .root_key(KEYS[0].public().clone())
+            .snapshot_key(KEYS[1].public().clone())
+            .targets_key(KEYS[2].public().clone())
+            .timestamp_key(KEYS[3].public().clone())
+            .signed::<Pouf1>(&KEYS[0])
+            .unwrap()
+            .to_raw()
+            .unwrap();
+
+        let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
+
+        let signed_targets = TargetsMetadataBuilder::new()
+            .version(ONE)
+            .signed::<Pouf1>(&KEYS[2])
+            .unwrap();
+
+        let snapshot_v1 = SnapshotMetadataBuilder::new()
+            .version(ONE)
+            .insert_metadata(&signed_targets, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Pouf1>(&KEYS[1])
+            .unwrap();
+        let raw_snapshot_v1 = snapshot_v1.to_raw().unwrap();
+
+        let raw_timestamp_v1 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot_v1, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(ONE)
+                .signed::<Pouf1>(&KEYS[3])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        tuf.update_timestamp(&now, &raw_timestamp_v1).unwrap();
+        tuf.update_snapshot(&now, &raw_snapshot_v1).unwrap();
+
+        let snapshot_v2 = SnapshotMetadataBuilder::new()
+            .version(TWO)
+            .signed::<Pouf1>(&KEYS[1])
+            .unwrap();
+        let raw_snapshot_v2 = snapshot_v2.to_raw().unwrap();
+
+        let raw_timestamp_v2 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot_v2, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(TWO)
+                .signed::<Pouf1>(&KEYS[3])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        tuf.update_timestamp(&now, &raw_timestamp_v2).unwrap();
+
+        assert_matches!(
+            tuf.update_snapshot(&now, &raw_snapshot_v2),
+            Err(Error::MissingMetadataDescription { parent_role, child_role })
+            if parent_role == MetadataPath::snapshot() && child_role == MetadataPath::targets()
+        );
+    }
+
+    #[test]
+    fn good_snapshot_update_remove_role_after_root_update() {
+        let now = Utc::now();
+
+        let raw_root_v1 = RootMetadataBuilder::new()
+            .root_key(KEYS[0].public().clone())
+            .snapshot_key(KEYS[1].public().clone())
+            .targets_key(KEYS[2].public().clone())
+            .timestamp_key(KEYS[3].public().clone())
+            .signed::<Pouf1>(&KEYS[0])
+            .unwrap()
+            .to_raw()
+            .unwrap();
+
+        let mut tuf = Database::from_trusted_root(&raw_root_v1).unwrap();
+
+        let signed_targets = TargetsMetadataBuilder::new()
+            .version(ONE)
+            .signed::<Pouf1>(&KEYS[2])
+            .unwrap();
+
+        let snapshot_v1 = SnapshotMetadataBuilder::new()
+            .version(ONE)
+            .insert_metadata(&signed_targets, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .insert_metadata_with_path("delegation", &signed_targets, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Pouf1>(&KEYS[1])
+            .unwrap();
+        let raw_snapshot_v1 = snapshot_v1.to_raw().unwrap();
+
+        let raw_timestamp_v1 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot_v1, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(ONE)
+                .signed::<Pouf1>(&KEYS[3])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        tuf.update_timestamp(&now, &raw_timestamp_v1).unwrap();
+        tuf.update_snapshot(&now, &raw_snapshot_v1).unwrap();
+
+        assert!(
+            tuf.trusted_snapshot()
+                .unwrap()
+                .meta()
+                .contains_key(&MetadataPath::new("delegation").unwrap())
+        );
+
+        let root_v2 = RootMetadataBuilder::new()
+            .version(TWO)
+            .root_key(KEYS[0].public().clone())
+            .snapshot_key(KEYS[0].public().clone())
+            .targets_key(KEYS[2].public().clone())
+            .timestamp_key(KEYS[3].public().clone())
+            .signed::<Pouf1>(&KEYS[0])
+            .unwrap();
+        let raw_root_v2 = root_v2.to_raw().unwrap();
+
+        tuf.update_root(&raw_root_v2).unwrap();
+
+        let snapshot_v2 = SnapshotMetadataBuilder::new()
+            .version(TWO)
+            .insert_metadata(&signed_targets, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Pouf1>(&KEYS[0])
+            .unwrap();
+        let raw_snapshot_v2 = snapshot_v2.to_raw().unwrap();
+
+        let raw_timestamp_v2 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot_v2, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(TWO)
+                .signed::<Pouf1>(&KEYS[3])
+                .unwrap()
+                .to_raw()
+                .unwrap();
+
+        tuf.update_timestamp(&now, &raw_timestamp_v2).unwrap();
+
+        assert_matches!(tuf.update_snapshot(&now, &raw_snapshot_v2), Ok(true));
+
+        assert!(
+            !tuf.trusted_snapshot()
+                .unwrap()
+                .meta()
+                .contains_key(&MetadataPath::new("delegation").unwrap())
+        );
     }
 
     #[test]
@@ -1461,7 +1808,7 @@ mod test {
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[2].public().clone())
             .timestamp_key(KEYS[3].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1469,21 +1816,21 @@ mod test {
         let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
 
         let signed_targets = TargetsMetadataBuilder::new()
-            .signed::<Json>(&KEYS[2])
+            .signed::<Pouf1>(&KEYS[2])
             .unwrap();
         let raw_targets = signed_targets.to_raw().unwrap();
 
         let snapshot = SnapshotMetadataBuilder::new()
             .insert_metadata(&signed_targets, &[HashAlgorithm::Sha256])
             .unwrap()
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
         let raw_snapshot = snapshot.to_raw().unwrap();
 
         let raw_timestamp =
             TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .signed::<Json>(&KEYS[3])
+                .signed::<Pouf1>(&KEYS[3])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1506,7 +1853,7 @@ mod test {
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[2].public().clone())
             .timestamp_key(KEYS[3].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1515,21 +1862,21 @@ mod test {
 
         let signed_targets = TargetsMetadataBuilder::new()
             // sign it with the timestamp key
-            .signed::<Json>(&KEYS[3])
+            .signed::<Pouf1>(&KEYS[3])
             .unwrap();
         let raw_targets = signed_targets.to_raw().unwrap();
 
         let snapshot = SnapshotMetadataBuilder::new()
             .insert_metadata(&signed_targets, &[HashAlgorithm::Sha256])
             .unwrap()
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
         let raw_snapshot = snapshot.to_raw().unwrap();
 
         let raw_timestamp =
             TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .signed::<Json>(&KEYS[3])
+                .signed::<Pouf1>(&KEYS[3])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1549,7 +1896,7 @@ mod test {
             .snapshot_key(KEYS[1].public().clone())
             .targets_key(KEYS[2].public().clone())
             .timestamp_key(KEYS[3].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1557,21 +1904,21 @@ mod test {
         let mut tuf = Database::from_trusted_root(&raw_root).unwrap();
 
         let signed_targets = TargetsMetadataBuilder::new()
-            .version(2)
-            .signed::<Json>(&KEYS[2])
+            .version(TWO)
+            .signed::<Pouf1>(&KEYS[2])
             .unwrap();
 
         let snapshot = SnapshotMetadataBuilder::new()
             .insert_metadata(&signed_targets, &[HashAlgorithm::Sha256])
             .unwrap()
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
         let raw_snapshot = snapshot.to_raw().unwrap();
 
         let raw_timestamp =
             TimestampMetadataBuilder::from_snapshot(&snapshot, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .signed::<Json>(&KEYS[3])
+                .signed::<Pouf1>(&KEYS[3])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1580,8 +1927,8 @@ mod test {
         tuf.update_snapshot(&now, &raw_snapshot).unwrap();
 
         let raw_targets = TargetsMetadataBuilder::new()
-            .version(1)
-            .signed::<Json>(&KEYS[2])
+            .version(ONE)
+            .signed::<Pouf1>(&KEYS[2])
             .unwrap()
             .to_raw()
             .unwrap();
@@ -1596,27 +1943,27 @@ mod test {
             .targets_key(KEYS[1].public().clone())
             .snapshot_key(KEYS[2].public().clone())
             .timestamp_key(KEYS[3].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
 
         let signed_targets1 = TargetsMetadataBuilder::new()
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
         let raw_targets1 = signed_targets1.to_raw().unwrap();
 
         let snapshot1 = SnapshotMetadataBuilder::new()
             .insert_metadata(&signed_targets1, &[HashAlgorithm::Sha256])
             .unwrap()
-            .signed::<Json>(&KEYS[2])
+            .signed::<Pouf1>(&KEYS[2])
             .unwrap();
         let raw_snapshot1 = snapshot1.to_raw().unwrap();
 
         let raw_timestamp1 =
             TimestampMetadataBuilder::from_snapshot(&snapshot1, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .signed::<Json>(&KEYS[3])
+                .signed::<Pouf1>(&KEYS[3])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1631,35 +1978,35 @@ mod test {
         let mut tuf = Database::from_trusted_metadata(&metadata1).unwrap();
 
         let raw_root2 = RootMetadataBuilder::new()
-            .version(2)
+            .version(TWO)
             .root_key(KEYS[0].public().clone())
             .targets_key(KEYS[1].public().clone())
             .snapshot_key(KEYS[2].public().clone())
             .timestamp_key(KEYS[3].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
 
         let signed_targets2 = TargetsMetadataBuilder::new()
-            .version(2)
-            .signed::<Json>(&KEYS[1])
+            .version(TWO)
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
         let raw_targets2 = signed_targets2.to_raw().unwrap();
 
         let snapshot2 = SnapshotMetadataBuilder::new()
-            .version(2)
+            .version(TWO)
             .insert_metadata(&signed_targets2, &[HashAlgorithm::Sha256])
             .unwrap()
-            .signed::<Json>(&KEYS[2])
+            .signed::<Pouf1>(&KEYS[2])
             .unwrap();
         let raw_snapshot2 = snapshot2.to_raw().unwrap();
 
         let raw_timestamp2 =
             TimestampMetadataBuilder::from_snapshot(&snapshot2, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .version(2)
-                .signed::<Json>(&KEYS[3])
+                .version(TWO)
+                .signed::<Pouf1>(&KEYS[3])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1672,147 +2019,6 @@ mod test {
             .build();
 
         assert_matches!(tuf.update_metadata(&metadata2), Ok(true));
-    }
-
-    #[test]
-    fn test_purge_metadata_preserves_trusted_root() {
-        // Build v1 metadata and load it as trusted.
-        let raw_root1 = RootMetadataBuilder::new()
-            .root_key(KEYS[0].public().clone())
-            .targets_key(KEYS[1].public().clone())
-            .snapshot_key(KEYS[2].public().clone())
-            .timestamp_key(KEYS[3].public().clone())
-            .signed::<Json>(&KEYS[0])
-            .unwrap()
-            .to_raw()
-            .unwrap();
-
-        let signed_targets1 = TargetsMetadataBuilder::new()
-            .signed::<Json>(&KEYS[1])
-            .unwrap();
-        let raw_targets1 = signed_targets1.to_raw().unwrap();
-
-        let snapshot1 = SnapshotMetadataBuilder::new()
-            .insert_metadata(&signed_targets1, &[HashAlgorithm::Sha256])
-            .unwrap()
-            .signed::<Json>(&KEYS[2])
-            .unwrap();
-        let raw_snapshot1 = snapshot1.to_raw().unwrap();
-
-        let raw_timestamp1 =
-            TimestampMetadataBuilder::from_snapshot(&snapshot1, &[HashAlgorithm::Sha256])
-                .unwrap()
-                .signed::<Json>(&KEYS[3])
-                .unwrap()
-                .to_raw()
-                .unwrap();
-
-        let metadata1 = RawSignedMetadataSetBuilder::new()
-            .root(raw_root1)
-            .targets(raw_targets1)
-            .snapshot(raw_snapshot1)
-            .timestamp(raw_timestamp1)
-            .build();
-
-        let mut tuf = Database::from_trusted_metadata(&metadata1).unwrap();
-
-        // Rotate to root v2 via update_metadata so trusted_root is advanced
-        // through the chained-rotation code path (not just replaced by TOFU).
-        let raw_root2 = RootMetadataBuilder::new()
-            .version(2)
-            .root_key(KEYS[0].public().clone())
-            .targets_key(KEYS[1].public().clone())
-            .snapshot_key(KEYS[2].public().clone())
-            .timestamp_key(KEYS[3].public().clone())
-            .signed::<Json>(&KEYS[0])
-            .unwrap()
-            .to_raw()
-            .unwrap();
-
-        let signed_targets2 = TargetsMetadataBuilder::new()
-            .version(2)
-            .signed::<Json>(&KEYS[1])
-            .unwrap();
-        let raw_targets2 = signed_targets2.to_raw().unwrap();
-
-        let snapshot2 = SnapshotMetadataBuilder::new()
-            .version(2)
-            .insert_metadata(&signed_targets2, &[HashAlgorithm::Sha256])
-            .unwrap()
-            .signed::<Json>(&KEYS[2])
-            .unwrap();
-        let raw_snapshot2 = snapshot2.to_raw().unwrap();
-
-        let raw_timestamp2 =
-            TimestampMetadataBuilder::from_snapshot(&snapshot2, &[HashAlgorithm::Sha256])
-                .unwrap()
-                .version(2)
-                .signed::<Json>(&KEYS[3])
-                .unwrap()
-                .to_raw()
-                .unwrap();
-
-        let metadata2 = RawSignedMetadataSetBuilder::new()
-            .root(raw_root2)
-            .targets(raw_targets2)
-            .snapshot(raw_snapshot2)
-            .timestamp(raw_timestamp2)
-            .build();
-
-        assert_matches!(tuf.update_metadata(&metadata2), Ok(true));
-
-        // Sanity: everything is populated and root is at v2.
-        assert_eq!(tuf.trusted_root().version(), 2);
-        assert!(tuf.trusted_snapshot().is_some());
-        assert!(tuf.trusted_targets().is_some());
-        assert!(tuf.trusted_timestamp().is_some());
-
-        // Purge: root stays at v2, derived metadata is cleared.
-        tuf.purge_metadata();
-
-        assert_eq!(tuf.trusted_root().version(), 2);
-        assert!(tuf.trusted_snapshot().is_none());
-        assert!(tuf.trusted_targets().is_none());
-        assert!(tuf.trusted_timestamp().is_none());
-        assert!(tuf.trusted_delegations().is_empty());
-
-        // A subsequent update must succeed against the retained trusted root:
-        // resubmit v2 timestamp/snapshot/targets without the root (which would
-        // otherwise be rejected as a rollback since we're already at v2).
-        let signed_targets2_replay = TargetsMetadataBuilder::new()
-            .version(2)
-            .signed::<Json>(&KEYS[1])
-            .unwrap();
-        let raw_targets2_replay = signed_targets2_replay.to_raw().unwrap();
-
-        let snapshot2_replay = SnapshotMetadataBuilder::new()
-            .version(2)
-            .insert_metadata(&signed_targets2_replay, &[HashAlgorithm::Sha256])
-            .unwrap()
-            .signed::<Json>(&KEYS[2])
-            .unwrap();
-        let raw_snapshot2_replay = snapshot2_replay.to_raw().unwrap();
-
-        let raw_timestamp2_replay =
-            TimestampMetadataBuilder::from_snapshot(&snapshot2_replay, &[HashAlgorithm::Sha256])
-                .unwrap()
-                .version(2)
-                .signed::<Json>(&KEYS[3])
-                .unwrap()
-                .to_raw()
-                .unwrap();
-
-        let metadata2_replay = RawSignedMetadataSetBuilder::new()
-            .targets(raw_targets2_replay)
-            .snapshot(raw_snapshot2_replay)
-            .timestamp(raw_timestamp2_replay)
-            .build();
-
-        assert_matches!(tuf.update_metadata(&metadata2_replay), Ok(true));
-        assert_eq!(tuf.trusted_root().version(), 2);
-        assert!(tuf.trusted_snapshot().is_some());
-        assert!(tuf.trusted_targets().is_some());
-        assert!(tuf.trusted_timestamp().is_some());
     }
 
     #[test]
@@ -1822,27 +2028,27 @@ mod test {
             .targets_key(KEYS[1].public().clone())
             .snapshot_key(KEYS[2].public().clone())
             .timestamp_key(KEYS[3].public().clone())
-            .signed::<Json>(&KEYS[0])
+            .signed::<Pouf1>(&KEYS[0])
             .unwrap()
             .to_raw()
             .unwrap();
 
         let signed_targets1 = TargetsMetadataBuilder::new()
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
         let raw_targets1 = signed_targets1.to_raw().unwrap();
 
         let snapshot1 = SnapshotMetadataBuilder::new()
             .insert_metadata(&signed_targets1, &[HashAlgorithm::Sha256])
             .unwrap()
-            .signed::<Json>(&KEYS[2])
+            .signed::<Pouf1>(&KEYS[2])
             .unwrap();
         let raw_snapshot1 = snapshot1.to_raw().unwrap();
 
         let raw_timestamp1 =
             TimestampMetadataBuilder::from_snapshot(&snapshot1, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .signed::<Json>(&KEYS[3])
+                .signed::<Pouf1>(&KEYS[3])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1857,35 +2063,35 @@ mod test {
         let mut tuf = Database::from_trusted_metadata(&metadata1).unwrap();
 
         let raw_root2 = RootMetadataBuilder::new()
-            .version(2)
+            .version(TWO)
             .root_key(KEYS[1].public().clone())
             .targets_key(KEYS[2].public().clone())
             .snapshot_key(KEYS[3].public().clone())
             .timestamp_key(KEYS[4].public().clone())
-            .signed::<Json>(&KEYS[1])
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap()
             .to_raw()
             .unwrap();
 
         let signed_targets2 = TargetsMetadataBuilder::new()
-            .version(2)
-            .signed::<Json>(&KEYS[1])
+            .version(TWO)
+            .signed::<Pouf1>(&KEYS[1])
             .unwrap();
         let raw_targets2 = signed_targets2.to_raw().unwrap();
 
         let snapshot2 = SnapshotMetadataBuilder::new()
-            .version(2)
+            .version(TWO)
             .insert_metadata(&signed_targets2, &[HashAlgorithm::Sha256])
             .unwrap()
-            .signed::<Json>(&KEYS[2])
+            .signed::<Pouf1>(&KEYS[2])
             .unwrap();
         let raw_snapshot2 = snapshot2.to_raw().unwrap();
 
         let raw_timestamp2 =
             TimestampMetadataBuilder::from_snapshot(&snapshot2, &[HashAlgorithm::Sha256])
                 .unwrap()
-                .version(2)
-                .signed::<Json>(&KEYS[3])
+                .version(TWO)
+                .signed::<Pouf1>(&KEYS[3])
                 .unwrap()
                 .to_raw()
                 .unwrap();
@@ -1902,9 +2108,85 @@ mod test {
             Err(Error::MetadataMissingSignatures {
                 role,
                 number_of_valid_signatures: 0,
-                threshold: 1,
+                threshold: MetadataThreshold::ONE,
             })
             if role == MetadataPath::root()
         );
+    }
+
+    #[test]
+    fn purge_metadata_preserves_advanced_trusted_root() {
+        let root1 = RootMetadataBuilder::new()
+            .root_key(KEYS[0].public().clone())
+            .targets_key(KEYS[1].public().clone())
+            .snapshot_key(KEYS[2].public().clone())
+            .timestamp_key(KEYS[3].public().clone())
+            .signed::<Pouf1>(&KEYS[0])
+            .unwrap();
+        let targets1 = TargetsMetadataBuilder::new()
+            .signed::<Pouf1>(&KEYS[1])
+            .unwrap();
+        let snapshot1 = SnapshotMetadataBuilder::new()
+            .insert_metadata(&targets1, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Pouf1>(&KEYS[2])
+            .unwrap();
+        let timestamp1 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot1, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .signed::<Pouf1>(&KEYS[3])
+                .unwrap();
+        let metadata1 = RawSignedMetadataSetBuilder::new()
+            .root(root1.to_raw().unwrap())
+            .targets(targets1.to_raw().unwrap())
+            .snapshot(snapshot1.to_raw().unwrap())
+            .timestamp(timestamp1.to_raw().unwrap())
+            .build();
+        let mut database = Database::from_trusted_metadata(&metadata1).unwrap();
+
+        let root2 = RootMetadataBuilder::new()
+            .version(TWO)
+            .root_key(KEYS[0].public().clone())
+            .targets_key(KEYS[1].public().clone())
+            .snapshot_key(KEYS[2].public().clone())
+            .timestamp_key(KEYS[3].public().clone())
+            .signed::<Pouf1>(&KEYS[0])
+            .unwrap();
+        database.update_root(&root2.to_raw().unwrap()).unwrap();
+
+        let targets2 = TargetsMetadataBuilder::new()
+            .version(TWO)
+            .signed::<Pouf1>(&KEYS[1])
+            .unwrap();
+        let snapshot2 = SnapshotMetadataBuilder::new()
+            .version(TWO)
+            .insert_metadata(&targets2, &[HashAlgorithm::Sha256])
+            .unwrap()
+            .signed::<Pouf1>(&KEYS[2])
+            .unwrap();
+        let timestamp2 =
+            TimestampMetadataBuilder::from_snapshot(&snapshot2, &[HashAlgorithm::Sha256])
+                .unwrap()
+                .version(TWO)
+                .signed::<Pouf1>(&KEYS[3])
+                .unwrap();
+        let metadata2 = RawSignedMetadataSetBuilder::new()
+            .targets(targets2.to_raw().unwrap())
+            .snapshot(snapshot2.to_raw().unwrap())
+            .timestamp(timestamp2.to_raw().unwrap())
+            .build();
+        assert_matches!(database.update_metadata(&metadata2), Ok(true));
+        assert_eq!(database.trusted_root().version(), TWO.into());
+        assert!(database.trusted_snapshot().is_some());
+        assert!(database.trusted_targets().is_some());
+        assert!(database.trusted_timestamp().is_some());
+
+        database.purge_metadata();
+
+        assert_eq!(database.trusted_root().version(), TWO.into());
+        assert!(database.trusted_snapshot().is_none());
+        assert!(database.trusted_targets().is_none());
+        assert!(database.trusted_timestamp().is_none());
+        assert!(database.trusted_delegations().is_empty());
     }
 }

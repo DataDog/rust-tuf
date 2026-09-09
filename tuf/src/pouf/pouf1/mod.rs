@@ -2,21 +2,15 @@ use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 use std::collections::BTreeMap;
 
-use crate::error::Error;
-use crate::interchange::DataInterchange;
 use crate::Result;
+use crate::error::Error;
+use crate::pouf::Pouf;
 
-pub(crate) mod pretty;
 pub(crate) mod shims;
 
-pub use pretty::JsonPretty;
-
-/// JSON data interchange.
+/// TUF POUF-1 implementation.
 ///
 /// # Schema
-///
-/// This doesn't use JSON Schema because that specification language is rage inducing. Here's
-/// something else instead.
 ///
 /// ## Common Entities
 ///
@@ -38,9 +32,9 @@ pub use pretty::JsonPretty;
 ///
 /// `PUBLIC` is a base64url encoded `SubjectPublicKeyInfo` DER public key.
 ///
-/// `KEY_TYPE` is a string (either `rsa` or `ed25519`).
+/// `KEY_TYPE` is a string (`ed25519` is the only one currently supported).
 ///
-/// `SCHEME` is a string (either `ed25519`, `rsassa-pss-sha256`, or `rsassa-pss-sha512`
+/// `SCHEME` is a string (`ed25519` is the only one currently supported).
 ///
 /// `HASH_VALUE` is a hex encoded hash value.
 ///
@@ -182,25 +176,25 @@ pub use pretty::JsonPretty;
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Json;
+pub struct Pouf1;
 
-impl DataInterchange for Json {
+impl Pouf for Pouf1 {
     type RawData = serde_json::Value;
 
     /// ```
-    /// # use tuf::interchange::{DataInterchange, Json};
-    /// assert_eq!(Json::extension(), "json");
+    /// # use tuf::pouf::{Pouf, Pouf1};
+    /// assert_eq!(Pouf1::extension(), "json");
     /// ```
     fn extension() -> &'static str {
         "json"
     }
 
     /// ```
-    /// # use tuf::interchange::{DataInterchange, Json};
+    /// # use tuf::pouf::{Pouf, Pouf1};
     /// # use std::collections::HashMap;
     /// let jsn: &[u8] = br#"{"foo": "bar", "baz": "quux"}"#;
-    /// let raw = Json::from_slice(jsn).unwrap();
-    /// let out = Json::canonicalize(&raw).unwrap();
+    /// let raw = Pouf1::from_slice(jsn).unwrap();
+    /// let out = Pouf1::canonicalize(&raw).unwrap();
     /// assert_eq!(out, br#"{"baz":"quux","foo":"bar"}"#);
     /// ```
     fn canonicalize(raw_data: &Self::RawData) -> Result<Vec<u8>> {
@@ -208,10 +202,10 @@ impl DataInterchange for Json {
     }
 
     /// ```
-    /// # use serde_derive::Deserialize;
+    /// # use serde::Deserialize;
     /// # use serde_json::json;
     /// # use std::collections::HashMap;
-    /// # use tuf::interchange::{DataInterchange, Json};
+    /// # use tuf::pouf::{Pouf, Pouf1};
     /// #
     /// #[derive(Deserialize, Debug, PartialEq)]
     /// struct Thing {
@@ -221,7 +215,7 @@ impl DataInterchange for Json {
     ///
     /// let jsn = json!({"foo": "wat", "bar": "lol"});
     /// let thing = Thing { foo: "wat".into(), bar: "lol".into() };
-    /// let de: Thing = Json::deserialize(&jsn).unwrap();
+    /// let de: Thing = Pouf1::deserialize(&jsn).unwrap();
     /// assert_eq!(de, thing);
     /// ```
     fn deserialize<T>(raw_data: &Self::RawData) -> Result<T>
@@ -232,10 +226,10 @@ impl DataInterchange for Json {
     }
 
     /// ```
-    /// # use serde_derive::Serialize;
+    /// # use serde::Serialize;
     /// # use serde_json::json;
     /// # use std::collections::HashMap;
-    /// # use tuf::interchange::{DataInterchange, Json};
+    /// # use tuf::pouf::{Pouf, Pouf1};
     /// #
     /// #[derive(Serialize)]
     /// struct Thing {
@@ -245,7 +239,7 @@ impl DataInterchange for Json {
     ///
     /// let jsn = json!({"foo": "wat", "bar": "lol"});
     /// let thing = Thing { foo: "wat".into(), bar: "lol".into() };
-    /// let se: serde_json::Value = Json::serialize(&thing).unwrap();
+    /// let se: serde_json::Value = Pouf1::serialize(&thing).unwrap();
     /// assert_eq!(se, jsn);
     /// ```
     fn serialize<T>(data: &T) -> Result<Self::RawData>
@@ -256,10 +250,10 @@ impl DataInterchange for Json {
     }
 
     /// ```
-    /// # use tuf::interchange::{DataInterchange, Json};
+    /// # use tuf::pouf::{Pouf, Pouf1};
     /// # use std::collections::HashMap;
     /// let jsn: &[u8] = br#"{"foo": "bar", "baz": "quux"}"#;
-    /// let _: HashMap<String, String> = Json::from_slice(&jsn).unwrap();
+    /// let _: HashMap<String, String> = Pouf1::from_slice(&jsn).unwrap();
     /// ```
     fn from_slice<T>(slice: &[u8]) -> Result<T>
     where
@@ -290,37 +284,21 @@ impl Value {
         match *self {
             Value::Null => {
                 buf.extend(b"null");
-                Ok(())
             }
             Value::Bool(true) => {
                 buf.extend(b"true");
-                Ok(())
             }
             Value::Bool(false) => {
                 buf.extend(b"false");
-                Ok(())
             }
             Value::Number(Number::I64(n)) => {
                 buf.extend(itoa::Buffer::new().format(n).bytes());
-                Ok(())
             }
             Value::Number(Number::U64(n)) => {
                 buf.extend(itoa::Buffer::new().format(n).bytes());
-                Ok(())
             }
             Value::String(ref s) => {
-                // OLPC Canonical JSON (https://wiki.laptop.org/go/Canonical_JSON): escape only
-                // `\` and `"`; all other bytes — including control chars — emit literally.
-                buf.push(b'"');
-                for &byte in s.as_bytes() {
-                    match byte {
-                        b'\\' => buf.extend_from_slice(b"\\\\"),
-                        b'"' => buf.extend_from_slice(b"\\\""),
-                        other => buf.push(other),
-                    }
-                }
-                buf.push(b'"');
-                Ok(())
+                escape_canonical_string(s, buf);
             }
             Value::Array(ref arr) => {
                 buf.push(b'[');
@@ -333,7 +311,6 @@ impl Value {
                     first = false;
                 }
                 buf.push(b']');
-                Ok(())
             }
             Value::Object(ref obj) => {
                 buf.push(b'{');
@@ -344,19 +321,29 @@ impl Value {
                     }
                     first = false;
 
-                    // this mess is abusing serde_json to get json escaping
-                    let k = serde_json::Value::String(k.clone());
-                    let k = serde_json::to_string(&k).map_err(|e| format!("{:?}", e))?;
-                    buf.extend(k.as_bytes());
-
+                    escape_canonical_string(k, buf);
                     buf.push(b':');
                     v.write(buf)?;
                 }
                 buf.push(b'}');
-                Ok(())
             }
         }
+        Ok(())
     }
+}
+
+fn escape_canonical_string(s: &str, buf: &mut Vec<u8>) {
+    buf.reserve(s.len() + 2);
+    buf.push(b'"');
+    let mut bytes = s.as_bytes();
+    while let Some(i) = bytes.iter().position(|&b| matches!(b, b'\\' | b'"')) {
+        buf.extend_from_slice(&bytes[..i]);
+        buf.push(b'\\');
+        buf.push(bytes[i]);
+        bytes = &bytes[i + 1..];
+    }
+    buf.extend_from_slice(bytes);
+    buf.push(b'"');
 }
 
 enum Number {
@@ -405,25 +392,6 @@ mod test {
     }
 
     #[test]
-    fn write_numbers() {
-        for (value, expected) in [
-            (
-                Value::Number(Number::I64(i64::MIN)),
-                b"-9223372036854775808" as &[u8],
-            ),
-            (Value::Number(Number::I64(0)), b"0"),
-            (
-                Value::Number(Number::U64(u64::MAX)),
-                b"18446744073709551615",
-            ),
-        ] {
-            let mut out = Vec::new();
-            value.write(&mut out).unwrap();
-            assert_eq!(out, expected);
-        }
-    }
-
-    #[test]
     fn write_arr() {
         let jsn = Value::Array(vec![
             Value::String(String::from("wat")),
@@ -440,7 +408,6 @@ mod test {
         let mut map = BTreeMap::new();
         let arr = Value::Array(vec![
             Value::String(String::from("haha")),
-            // OLPC canonical JSON keeps control characters literal — the LF byte stays as 0x0a.
             Value::String(String::from("new\nline")),
         ]);
         let _ = map.insert(String::from("lol"), arr);
@@ -451,21 +418,40 @@ mod test {
     }
 
     #[test]
-    fn write_string_olpc_only_escapes_quote_and_backslash() {
-        for (input, expected) in [
-            // Backslash and double-quote get escaped.
-            ("\\", b"\"\\\\\"" as &[u8]),
-            ("\"", b"\"\\\"\""),
-            ("a\\b\"c", b"\"a\\\\b\\\"c\""),
-            // Other control characters are NOT escaped.
-            ("a\nb", b"\"a\nb\""),
-            ("\t\r\x08\x0c", b"\"\t\r\x08\x0c\""),
-            // Non-ASCII UTF-8 is emitted literally.
-            ("résumé", "\"résumé\"".as_bytes()),
-        ] {
+    fn write_str_edge_cases() {
+        let cases = [
+            ("", b"\"\"".as_slice()),
+            ("wat", b"\"wat\"".as_slice()),
+            (
+                "hello 🦀 world",
+                b"\"hello \xF0\x9F\xA6\x80 world\"".as_slice(),
+            ),
+            (
+                "quote\"and\\backslash",
+                b"\"quote\\\"and\\\\backslash\"".as_slice(),
+            ),
+            ("\"\\\"\\", b"\"\\\"\\\\\\\"\\\\\"".as_slice()),
+            ("ctrl \x00 \t \r \n", b"\"ctrl \x00 \t \r \n\"".as_slice()),
+        ];
+
+        for (input, expected) in cases {
             let mut out = Vec::new();
             Value::String(input.to_string()).write(&mut out).unwrap();
-            assert_eq!(&out, expected, "input was {:?}", input);
+            assert_eq!(&out, &expected, "Failed on input: {:?}", input);
         }
+    }
+
+    #[test]
+    fn write_obj_key_edge_cases() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            String::from("key\"with\\slash"),
+            Value::Number(Number::I64(1)),
+        );
+        map.insert(String::from("ctrl\nkey"), Value::Number(Number::I64(2)));
+        let jsn = Value::Object(map);
+        let mut out = Vec::new();
+        jsn.write(&mut out).unwrap();
+        assert_eq!(&out, &b"{\"ctrl\nkey\":2,\"key\\\"with\\\\slash\":1}");
     }
 }

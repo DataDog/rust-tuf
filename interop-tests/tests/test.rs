@@ -37,21 +37,23 @@
 use assert_matches::assert_matches;
 use futures_executor::block_on;
 use futures_util::io::AsyncReadExt;
+use interop_tests::JsonPretty;
 use pretty_assertions::assert_eq;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tuf::client::{Client, Config};
 use tuf::crypto::PublicKey;
-use tuf::interchange::{DataInterchange, Json, JsonPretty};
-use tuf::metadata::{MetadataPath, MetadataVersion, RawSignedMetadata, RootMetadata, TargetPath};
+use tuf::metadata::{
+    MetadataPath, MetadataThreshold, MetadataVersion, RawSignedMetadata, RootMetadata, TargetPath,
+};
+use tuf::pouf::{Pouf, Pouf1};
 use tuf::repository::{
     EphemeralRepository, FileSystemRepository, FileSystemRepositoryBuilder, RepositoryProvider,
 };
-use tuf::Result;
 
 #[test]
 fn fuchsia_go_tuf_consistent_snapshot_false() {
-    test_key_rotation::<Json>(
+    test_key_rotation::<Pouf1>(
         Path::new("tests")
             .join("fuchsia-go-tuf-5527fe")
             .join("consistent-snapshot-false"),
@@ -60,7 +62,7 @@ fn fuchsia_go_tuf_consistent_snapshot_false() {
 
 #[test]
 fn fuchsia_go_tuf_consistent_snapshot_true() {
-    test_key_rotation::<Json>(
+    test_key_rotation::<Pouf1>(
         Path::new("tests")
             .join("fuchsia-go-tuf-5527fe")
             .join("consistent-snapshot-true"),
@@ -69,7 +71,7 @@ fn fuchsia_go_tuf_consistent_snapshot_true() {
 
 #[test]
 fn fuchsia_go_tuf_transition_m4_consistent_snapshot_false() {
-    test_key_rotation::<Json>(
+    test_key_rotation::<Pouf1>(
         Path::new("tests")
             .join("fuchsia-go-tuf-transition-M4")
             .join("consistent-snapshot-false"),
@@ -78,7 +80,7 @@ fn fuchsia_go_tuf_transition_m4_consistent_snapshot_false() {
 
 #[test]
 fn fuchsia_go_tuf_transition_m4_consistent_snapshot_true() {
-    test_key_rotation::<Json>(
+    test_key_rotation::<Pouf1>(
         Path::new("tests")
             .join("fuchsia-go-tuf-transition-M4")
             .join("consistent-snapshot-true"),
@@ -106,7 +108,7 @@ fn rust_tuf_identity_consistent_snapshot_true() {
 
 fn test_key_rotation<D>(dir: PathBuf)
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
 {
     block_on(async {
         let mut suite = TestKeyRotation::<D>::new(dir);
@@ -117,7 +119,7 @@ where
 /// TestKeyRotation is the main driver for running the key rotation tests.
 struct TestKeyRotation<D>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
 {
     /// The paths to each test step directory.
     test_steps: Vec<PathBuf>,
@@ -132,7 +134,7 @@ where
 
 impl<D> TestKeyRotation<D>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
 {
     fn new(test_dir: PathBuf) -> Self {
         let mut test_steps = Vec::new();
@@ -171,13 +173,13 @@ where
     }
 
     async fn run_test_step(&mut self, public_keys: &[PublicKey], dir: PathBuf) {
-        let remote = init_remote(&dir).unwrap();
+        let remote = init_remote(&dir);
 
         // Connect to the client with our initial keys.
         let mut client = Client::with_trusted_root_keys(
             Config::default(),
-            MetadataVersion::Number(1),
-            1,
+            MetadataVersion::ONE,
+            MetadataThreshold::ONE,
             public_keys,
             &mut self.local,
             remote,
@@ -208,15 +210,15 @@ where
 /// Extract the initial key ids from the first step.
 async fn extract_keys<D>(dir: &Path) -> Vec<PublicKey>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
 {
-    let remote = init_remote::<D>(dir).unwrap();
+    let remote = init_remote::<D>(dir);
 
     let root_path = MetadataPath::root();
 
     let mut buf = Vec::new();
     let mut reader = remote
-        .fetch_metadata(&root_path, MetadataVersion::Number(1))
+        .fetch_metadata(&root_path, Some(MetadataVersion::ONE))
         .await
         .unwrap();
     reader.read_to_end(&mut buf).await.unwrap();
@@ -229,9 +231,9 @@ where
     metadata.root_keys().cloned().collect()
 }
 
-fn init_remote<D>(dir: &Path) -> Result<FileSystemRepository<D>>
+fn init_remote<D>(dir: &Path) -> FileSystemRepository<D>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
 {
     FileSystemRepositoryBuilder::new(dir)
         .metadata_prefix(Path::new("repository"))

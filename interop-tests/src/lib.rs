@@ -1,11 +1,11 @@
 use chrono::offset::{TimeZone, Utc};
 use data_encoding::HEXLOWER;
-use serde_derive::Deserialize;
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
+use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
 use tuf::crypto::{Ed25519PrivateKey, HashAlgorithm, KeyType, PrivateKey, SignatureScheme};
-use tuf::interchange::JsonPretty;
 use tuf::metadata::{
     MetadataPath, MetadataVersion, Role, SnapshotMetadataBuilder, TargetPath,
     TargetsMetadataBuilder, TimestampMetadataBuilder,
@@ -13,6 +13,9 @@ use tuf::metadata::{
 use tuf::repo_builder::RepoBuilder;
 use tuf::repository::{FileSystemRepository, FileSystemRepositoryBuilder, RepositoryStorage};
 use walkdir::WalkDir;
+
+mod pretty;
+pub use pretty::JsonPretty;
 
 // These structs and functions are necessary to parse keys.json, which contains the keys
 // used by go-tuf to generate the equivalent metadata. We use the same keys to facilitate
@@ -66,7 +69,7 @@ fn init_role_keys(json_keys: &TestKeys) -> RoleKeys {
     keys
 }
 
-fn copy_repo(dir: &Path, step: u8) {
+fn copy_repo(dir: &Path, step: u32) {
     let src = Path::new(dir)
         .join((step - 1).to_string())
         .join("repository");
@@ -74,10 +77,10 @@ fn copy_repo(dir: &Path, step: u8) {
 
     for (path, f) in read_dir_files(&src) {
         let path = dst.join(path);
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent).unwrap();
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent).unwrap();
         }
         fs::write(path, &f).unwrap();
     }
@@ -91,7 +94,7 @@ pub fn read_dir_files(path: &Path) -> BTreeMap<PathBuf, String> {
             let f = fs::read_to_string(entry.path()).unwrap();
 
             // Strip off the path prefix.
-            let path = entry.into_path().strip_prefix(&path).unwrap().to_path_buf();
+            let path = entry.into_path().strip_prefix(path).unwrap().to_path_buf();
 
             entries.insert(path, f);
         }
@@ -106,11 +109,13 @@ async fn update_root(
     repo: &mut FileSystemRepository<JsonPretty>,
     keys: &RoleKeys,
     root_signer: Option<&dyn PrivateKey>,
-    version: u64,
+    version: impl Into<MetadataVersion>,
     consistent_snapshot: bool,
 ) {
+    let version = version.into();
+
     // Same expiration as go-tuf metadata generator.
-    let expiration = Utc.ymd(2100, 1, 1).and_hms(0, 0, 0);
+    let expiration = Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap();
 
     let mut repo_builder = RepoBuilder::create(repo)
         .trusted_root_keys(&[keys.get("root").unwrap()])
@@ -143,12 +148,12 @@ async fn update_root(
 async fn add_target(
     repo: &mut FileSystemRepository<JsonPretty>,
     keys: &RoleKeys,
-    step: u8,
+    step: u32,
     consistent_snapshot: bool,
 ) {
     // Same expiration as go-tuf metadata generator.
-    let expiration = Utc.ymd(2100, 1, 1).and_hms(0, 0, 0);
-    let version: u64 = (step + 1).into();
+    let expiration = Utc.with_ymd_and_hms(2100, 1, 1, 0, 0, 0).unwrap();
+    let version = MetadataVersion::new(NonZeroU64::new(u64::from(step) + 1).unwrap());
 
     let mut targets_builder = TargetsMetadataBuilder::new()
         .expires(expiration)
@@ -193,9 +198,9 @@ async fn add_target(
         .unwrap();
 
     let version_prefix = if consistent_snapshot {
-        MetadataVersion::Number(version)
+        Some(version)
     } else {
-        MetadataVersion::None
+        None
     };
 
     repo.store_metadata(
@@ -234,7 +239,7 @@ async fn add_target(
     // Timestamp doesn't require a version prefix even in consistent_snapshot.
     repo.store_metadata(
         &timestamp_path,
-        MetadataVersion::None,
+        None,
         &mut timestamp.to_raw().unwrap().as_bytes(),
     )
     .await
@@ -256,28 +261,33 @@ pub async fn generate_repos(
     let mut repo = FileSystemRepositoryBuilder::new(dir0)
         .metadata_prefix(Path::new("repository"))
         .targets_prefix(Path::new("repository").join("targets"))
-        .build()?;
+        .build();
 
-    update_root(&mut repo, &keys, None, 1, consistent_snapshot).await;
-    add_target(&mut repo, &keys, 0, consistent_snapshot).await;
+    update_root(
+        &mut repo,
+        &keys,
+        None,
+        MetadataVersion::ONE,
+        consistent_snapshot,
+    )
+    .await;
+    add_target(&mut repo, &keys, 0_u32, consistent_snapshot).await;
 
     // Queue up a series of key rotations
-    let mut i: u8 = 1;
-    let rotations = vec![
+    let rotations = [
         Some(Role::Root),
         Some(Role::Targets),
         Some(Role::Snapshot),
         Some(Role::Timestamp),
         None,
     ];
-    for r in rotations.iter() {
+    for (i, r) in (1_u32..).zip(rotations.iter()) {
         // Initialize new repo and copy the files from the previous step.
         let dir_i = Path::new(dir).join(i.to_string());
         let mut repo = FileSystemRepositoryBuilder::new(dir_i)
             .metadata_prefix(Path::new("repository"))
             .targets_prefix(Path::new("repository").join("targets"))
-            .build()
-            .unwrap();
+            .build();
         copy_repo(dir, i);
 
         let root_signer = match r {
@@ -300,12 +310,11 @@ pub async fn generate_repos(
             &mut repo,
             &keys,
             root_signer.as_ref().map(|x| x as &dyn PrivateKey),
-            (i + 1).into(),
+            NonZeroU32::new(i + 1).unwrap(),
             consistent_snapshot,
         )
         .await;
         add_target(&mut repo, &keys, i, consistent_snapshot).await;
-        i += 1;
     }
     Ok(())
 }
