@@ -7,7 +7,17 @@
 
 A Rust implementation of [The Update Framework (TUF)](https://theupdateframework.github.io/).
 
-Full documentation is hosted at [docs.rs](https://docs.rs/crate/tuf).
+Full documentation is hosted at [docs.rs](https://docs.rs/libdd-tuf).
+
+## Fork compatibility
+
+The package is published as `libdd-tuf`, while the Rust library name remains `tuf`.
+`tuf::interchange::Json` and `tuf::interchange::DataInterchange` remain aliases for the upstream
+`tuf::pouf::Pouf1` type and `tuf::pouf::Pouf` trait.
+
+`EphemeralRepository::get_target` provides synchronous access to in-memory targets and returns an
+`Arc<[u8]>`. Returning owned shared bytes preserves upstream's concurrent repository updates
+without exposing a lock guard or an unsound borrowed reference.
 
 ## Warning: Beta Software
 
@@ -16,13 +26,12 @@ the API is unstable and you should be prepared to refactor on even patch release
 
 ## Contributing
 
-Please make all pull requests to the `develop` branch.
+Please make all pull requests to the `libdatadog-develop` branch.
 
 ### Bugs
 
-This project has a **full disclosure** policy on security related errors. Please
-treat these errors like all other bugs and file a public issue. Errors communicated
-via other channels will be immediately made public.
+Use the issue tracker for non-security bugs. Follow [SECURITY.md](./SECURITY.md) to report a
+vulnerability privately.
 
 ## Legal
 

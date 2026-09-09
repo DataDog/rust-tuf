@@ -1,15 +1,16 @@
 use assert_matches::assert_matches;
 use chrono::offset::Utc;
 use futures_executor::block_on;
+use tuf::Database;
+use tuf::Error;
 use tuf::crypto::{Ed25519PrivateKey, HashAlgorithm, PrivateKey};
-use tuf::interchange::Json;
 use tuf::metadata::{
     Delegation, Delegations, MetadataDescription, MetadataPath, TargetPath, TargetsMetadataBuilder,
 };
+use tuf::metadata::{MetadataThreshold, MetadataVersion};
+use tuf::pouf::Pouf1;
 use tuf::repo_builder::RepoBuilder;
 use tuf::repository::EphemeralRepository;
-use tuf::Database;
-use tuf::Error;
 
 const ED25519_1_PK8: &[u8] = include_bytes!("./ed25519/ed25519-1.pk8.der");
 const ED25519_2_PK8: &[u8] = include_bytes!("./ed25519/ed25519-2.pk8.der");
@@ -50,7 +51,12 @@ fn simple_delegation() {
             .stage_snapshot_with_builder(|builder| {
                 builder.insert_metadata_description(
                     MetadataPath::new("delegation").unwrap(),
-                    MetadataDescription::from_slice(&[0u8], 1, &[HashAlgorithm::Sha256]).unwrap(),
+                    MetadataDescription::from_slice(
+                        &[0u8],
+                        MetadataVersion::ONE,
+                        &[HashAlgorithm::Sha256],
+                    )
+                    .unwrap(),
                 )
             })
             .unwrap()
@@ -58,7 +64,7 @@ fn simple_delegation() {
             .await
             .unwrap();
 
-        let mut tuf = Database::<Json>::from_trusted_metadata(&metadata).unwrap();
+        let mut tuf = Database::<Pouf1>::from_trusted_metadata(&metadata).unwrap();
 
         //// build the targets ////
         //// build the delegation ////
@@ -70,7 +76,7 @@ fn simple_delegation() {
                 &[HashAlgorithm::Sha256],
             )
             .unwrap()
-            .signed::<Json>(&delegation_key)
+            .signed::<Pouf1>(&delegation_key)
             .unwrap();
         let raw_delegation = delegation.to_raw().unwrap();
 
@@ -82,9 +88,10 @@ fn simple_delegation() {
         )
         .unwrap();
 
-        assert!(tuf
-            .target_description(&TargetPath::new("foo").unwrap())
-            .is_ok());
+        assert!(
+            tuf.target_description(&TargetPath::new("foo").unwrap())
+                .is_ok()
+        );
     })
 }
 
@@ -122,13 +129,21 @@ fn nested_delegation() {
                 builder
                     .insert_metadata_description(
                         MetadataPath::new("delegation-a").unwrap(),
-                        MetadataDescription::from_slice(&[0u8], 1, &[HashAlgorithm::Sha256])
-                            .unwrap(),
+                        MetadataDescription::from_slice(
+                            &[0u8],
+                            MetadataVersion::ONE,
+                            &[HashAlgorithm::Sha256],
+                        )
+                        .unwrap(),
                     )
                     .insert_metadata_description(
                         MetadataPath::new("delegation-b").unwrap(),
-                        MetadataDescription::from_slice(&[0u8], 1, &[HashAlgorithm::Sha256])
-                            .unwrap(),
+                        MetadataDescription::from_slice(
+                            &[0u8],
+                            MetadataVersion::ONE,
+                            &[HashAlgorithm::Sha256],
+                        )
+                        .unwrap(),
                     )
             })
             .unwrap()
@@ -136,7 +151,7 @@ fn nested_delegation() {
             .await
             .unwrap();
 
-        let mut tuf = Database::<Json>::from_trusted_metadata(&metadata).unwrap();
+        let mut tuf = Database::<Pouf1>::from_trusted_metadata(&metadata).unwrap();
 
         //// build delegation B ////
 
@@ -154,7 +169,7 @@ fn nested_delegation() {
 
         let delegation = TargetsMetadataBuilder::new()
             .delegations(delegations)
-            .signed::<Json>(&delegation_a_key)
+            .signed::<Pouf1>(&delegation_a_key)
             .unwrap();
         let raw_delegation = delegation.to_raw().unwrap();
 
@@ -177,7 +192,7 @@ fn nested_delegation() {
                 &[HashAlgorithm::Sha256],
             )
             .unwrap()
-            .signed::<Json>(&delegation_b_key)
+            .signed::<Pouf1>(&delegation_b_key)
             .unwrap();
         let raw_delegation = delegation.to_raw().unwrap();
 
@@ -189,9 +204,10 @@ fn nested_delegation() {
         )
         .unwrap();
 
-        assert!(tuf
-            .target_description(&TargetPath::new("foo").unwrap())
-            .is_ok());
+        assert!(
+            tuf.target_description(&TargetPath::new("foo").unwrap())
+                .is_ok()
+        );
     })
 }
 
@@ -228,7 +244,12 @@ fn rejects_bad_delegation_signatures() {
             .stage_snapshot_with_builder(|builder| {
                 builder.insert_metadata_description(
                     MetadataPath::new("delegation").unwrap(),
-                    MetadataDescription::from_slice(&[0u8], 1, &[HashAlgorithm::Sha256]).unwrap(),
+                    MetadataDescription::from_slice(
+                        &[0u8],
+                        MetadataVersion::ONE,
+                        &[HashAlgorithm::Sha256],
+                    )
+                    .unwrap(),
                 )
             })
             .unwrap()
@@ -236,7 +257,7 @@ fn rejects_bad_delegation_signatures() {
             .await
             .unwrap();
 
-        let mut tuf = Database::<Json>::from_trusted_metadata(&metadata).unwrap();
+        let mut tuf = Database::<Pouf1>::from_trusted_metadata(&metadata).unwrap();
 
         //// build the delegation ////
         let target_file: &[u8] = b"bar";
@@ -247,7 +268,7 @@ fn rejects_bad_delegation_signatures() {
                 &[HashAlgorithm::Sha256],
             )
             .unwrap()
-            .signed::<Json>(&bad_delegation_key)
+            .signed::<Pouf1>(&bad_delegation_key)
             .unwrap();
         let raw_delegation = delegation.to_raw().unwrap();
 
@@ -261,7 +282,7 @@ fn rejects_bad_delegation_signatures() {
             Err(Error::MetadataMissingSignatures {
                 role,
                 number_of_valid_signatures: 0,
-                threshold: 1,
+                threshold: MetadataThreshold::ONE,
             })
             if role == MetadataPath::new("delegation").unwrap()
         );
@@ -317,7 +338,7 @@ fn diamond_delegation() {
 
         let delegation_a = TargetsMetadataBuilder::new()
             .delegations(delegations_a)
-            .signed::<Json>(&delegation_a_key)
+            .signed::<Pouf1>(&delegation_a_key)
             .unwrap();
         let raw_delegation_a = delegation_a.to_raw().unwrap();
 
@@ -338,7 +359,7 @@ fn diamond_delegation() {
 
         let delegation_b = TargetsMetadataBuilder::new()
             .delegations(delegations_b)
-            .signed::<Json>(&delegation_b_key)
+            .signed::<Pouf1>(&delegation_b_key)
             .unwrap();
         let raw_delegation_b = delegation_b.to_raw().unwrap();
 
@@ -360,7 +381,7 @@ fn diamond_delegation() {
                 &[HashAlgorithm::Sha256],
             )
             .unwrap()
-            .signed::<Json>(&delegation_c_key)
+            .signed::<Pouf1>(&delegation_c_key)
             .unwrap();
         let raw_delegation_c = delegation_c.to_raw().unwrap();
 
@@ -398,7 +419,7 @@ fn diamond_delegation() {
                         MetadataPath::new("delegation-a").unwrap(),
                         MetadataDescription::from_slice(
                             raw_delegation_a.as_bytes(),
-                            1,
+                            MetadataVersion::ONE,
                             &[HashAlgorithm::Sha256],
                         )
                         .unwrap(),
@@ -407,7 +428,7 @@ fn diamond_delegation() {
                         MetadataPath::new("delegation-b").unwrap(),
                         MetadataDescription::from_slice(
                             raw_delegation_b.as_bytes(),
-                            1,
+                            MetadataVersion::ONE,
                             &[HashAlgorithm::Sha256],
                         )
                         .unwrap(),
@@ -416,7 +437,7 @@ fn diamond_delegation() {
                         MetadataPath::new("delegation-c").unwrap(),
                         MetadataDescription::from_slice(
                             raw_delegation_c.as_bytes(),
-                            1,
+                            MetadataVersion::ONE,
                             &[HashAlgorithm::Sha256],
                         )
                         .unwrap(),
@@ -427,7 +448,7 @@ fn diamond_delegation() {
             .await
             .unwrap();
 
-        let mut tuf = Database::<Json>::from_trusted_metadata(&metadata).unwrap();
+        let mut tuf = Database::<Pouf1>::from_trusted_metadata(&metadata).unwrap();
 
         //// Verify we can trust delegation-a and delegation-b..
 
@@ -459,7 +480,7 @@ fn diamond_delegation() {
             Err(Error::MetadataMissingSignatures {
                 role,
                 number_of_valid_signatures: 0,
-                threshold: 1,
+                threshold: MetadataThreshold::ONE,
             })
             if role == MetadataPath::new("delegation-c").unwrap()
         );
@@ -472,9 +493,10 @@ fn diamond_delegation() {
         )
         .unwrap();
 
-        assert!(tuf
-            .target_description(&TargetPath::new("foo").unwrap())
-            .is_ok());
+        assert!(
+            tuf.target_description(&TargetPath::new("foo").unwrap())
+                .is_ok()
+        );
 
         let target_path = TargetPath::new("bar").unwrap();
         assert_matches!(

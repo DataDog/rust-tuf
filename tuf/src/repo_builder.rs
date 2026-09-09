@@ -5,21 +5,21 @@ use {
         crypto::{self, HashAlgorithm, PrivateKey, PublicKey},
         database::Database,
         error::{Error, Result},
-        interchange::DataInterchange,
         metadata::{
             Delegation, DelegationsBuilder, Metadata, MetadataDescription, MetadataPath,
-            MetadataVersion, RawSignedMetadata, RawSignedMetadataSet, RawSignedMetadataSetBuilder,
-            RootMetadata, RootMetadataBuilder, SignedMetadataBuilder, SnapshotMetadata,
-            SnapshotMetadataBuilder, TargetDescription, TargetPath, TargetsMetadata,
-            TargetsMetadataBuilder, TimestampMetadata, TimestampMetadataBuilder,
+            MetadataThreshold, MetadataVersion, RawSignedMetadata, RawSignedMetadataSet,
+            RawSignedMetadataSetBuilder, RootMetadata, RootMetadataBuilder, SignedMetadataBuilder,
+            SnapshotMetadata, SnapshotMetadataBuilder, TargetDescription, TargetPath,
+            TargetsMetadata, TargetsMetadataBuilder, TimestampMetadata, TimestampMetadataBuilder,
         },
+        pouf::Pouf,
         repository::RepositoryStorage,
         verify::Verified,
     },
     chrono::{DateTime, Duration, Utc},
     futures_io::{AsyncRead, AsyncSeek},
     futures_util::AsyncSeekExt as _,
-    std::{collections::HashMap, io::SeekFrom, marker::PhantomData},
+    std::{collections::HashMap, io::SeekFrom, marker::PhantomData, num::NonZeroU64},
 };
 
 mod private {
@@ -31,11 +31,16 @@ mod private {
     pub trait Sealed {}
 
     impl Sealed for Root {}
-    impl<D: DataInterchange> Sealed for Targets<D> {}
-    impl<D: DataInterchange> Sealed for Snapshot<D> {}
-    impl<D: DataInterchange> Sealed for Timestamp<D> {}
-    impl<D: DataInterchange> Sealed for Done<D> {}
+    impl<D: Pouf> Sealed for Targets<D> {}
+    impl<D: Pouf> Sealed for Snapshot<D> {}
+    impl<D: Pouf> Sealed for Timestamp<D> {}
+    impl<D: Pouf> Sealed for Done<D> {}
 }
+
+const DEFAULT_ROOT_EXPIRATION: Duration = Duration::days(365);
+const DEFAULT_TARGETS_EXPIRATION: Duration = Duration::days(90);
+const DEFAULT_SNAPSHOT_EXPIRATION: Duration = Duration::days(7);
+const DEFAULT_TIMESTAMP_EXPIRATION: Duration = Duration::days(1);
 
 /// Trait to track each of the [RepoBuilder] building states.
 ///
@@ -55,7 +60,7 @@ impl State for Root {}
 
 /// State to stage a targets metadata.
 #[doc(hidden)]
-pub struct Targets<D: DataInterchange> {
+pub struct Targets<D: Pouf> {
     staged_root: Option<Staged<D, RootMetadata>>,
     targets: HashMap<TargetPath, TargetDescription>,
     delegation_keys: Vec<PublicKey>,
@@ -64,7 +69,7 @@ pub struct Targets<D: DataInterchange> {
     inherit_from_trusted_targets: bool,
 }
 
-impl<D: DataInterchange> Targets<D> {
+impl<D: Pouf> Targets<D> {
     fn new(staged_root: Option<Staged<D, RootMetadata>>) -> Self {
         Self {
             staged_root,
@@ -77,11 +82,11 @@ impl<D: DataInterchange> Targets<D> {
     }
 }
 
-impl<D: DataInterchange> State for Targets<D> {}
+impl<D: Pouf> State for Targets<D> {}
 
 /// State to stage a snapshot metadata.
 #[doc(hidden)]
-pub struct Snapshot<D: DataInterchange> {
+pub struct Snapshot<D: Pouf> {
     staged_root: Option<Staged<D, RootMetadata>>,
     staged_targets: Option<Staged<D, TargetsMetadata>>,
     include_targets_length: bool,
@@ -89,9 +94,9 @@ pub struct Snapshot<D: DataInterchange> {
     inherit_from_trusted_snapshot: bool,
 }
 
-impl<D: DataInterchange> State for Snapshot<D> {}
+impl<D: Pouf> State for Snapshot<D> {}
 
-impl<D: DataInterchange> Snapshot<D> {
+impl<D: Pouf> Snapshot<D> {
     fn new(
         staged_root: Option<Staged<D, RootMetadata>>,
         staged_targets: Option<Staged<D, TargetsMetadata>>,
@@ -105,7 +110,7 @@ impl<D: DataInterchange> Snapshot<D> {
         }
     }
 
-    fn targets_description(&self) -> Result<Option<MetadataDescription>> {
+    fn targets_description(&self) -> Result<Option<MetadataDescription<TargetsMetadata>>> {
         if let Some(ref targets) = self.staged_targets {
             let length = if self.include_targets_length {
                 Some(targets.raw.as_bytes().len())
@@ -134,7 +139,7 @@ impl<D: DataInterchange> Snapshot<D> {
 }
 
 /// State to stage a timestamp metadata.
-pub struct Timestamp<D: DataInterchange> {
+pub struct Timestamp<D: Pouf> {
     staged_root: Option<Staged<D, RootMetadata>>,
     staged_targets: Option<Staged<D, TargetsMetadata>>,
     staged_snapshot: Option<Staged<D, SnapshotMetadata>>,
@@ -142,7 +147,7 @@ pub struct Timestamp<D: DataInterchange> {
     snapshot_hash_algorithms: Vec<HashAlgorithm>,
 }
 
-impl<D: DataInterchange> Timestamp<D> {
+impl<D: Pouf> Timestamp<D> {
     fn new(state: Snapshot<D>, staged_snapshot: Option<Staged<D, SnapshotMetadata>>) -> Self {
         Self {
             staged_root: state.staged_root,
@@ -153,7 +158,7 @@ impl<D: DataInterchange> Timestamp<D> {
         }
     }
 
-    fn snapshot_description(&self) -> Result<Option<MetadataDescription>> {
+    fn snapshot_description(&self) -> Result<Option<MetadataDescription<SnapshotMetadata>>> {
         if let Some(ref snapshot) = self.staged_snapshot {
             let length = if self.include_snapshot_length {
                 Some(snapshot.raw.as_bytes().len())
@@ -181,26 +186,26 @@ impl<D: DataInterchange> Timestamp<D> {
     }
 }
 
-impl<D: DataInterchange> State for Timestamp<D> {}
+impl<D: Pouf> State for Timestamp<D> {}
 
 /// The final state for building repository metadata.
-pub struct Done<D: DataInterchange> {
+pub struct Done<D: Pouf> {
     staged_root: Option<Staged<D, RootMetadata>>,
     staged_targets: Option<Staged<D, TargetsMetadata>>,
     staged_snapshot: Option<Staged<D, SnapshotMetadata>>,
     staged_timestamp: Option<Staged<D, TimestampMetadata>>,
 }
 
-impl<D: DataInterchange> State for Done<D> {}
+impl<D: Pouf> State for Done<D> {}
 
-struct Staged<D: DataInterchange, M: Metadata> {
+struct Staged<D: Pouf, M: Metadata> {
     metadata: M,
     raw: RawSignedMetadata<D, M>,
 }
 
 struct RepoContext<'a, D, R>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
     R: RepositoryStorage<D>,
 {
     repo: R,
@@ -214,12 +219,17 @@ where
     trusted_targets_keys: Vec<&'a dyn PrivateKey>,
     trusted_snapshot_keys: Vec<&'a dyn PrivateKey>,
     trusted_timestamp_keys: Vec<&'a dyn PrivateKey>,
-    _interchange: PhantomData<D>,
+    time_version: Option<MetadataVersion>,
+    root_expiration_duration: Duration,
+    targets_expiration_duration: Duration,
+    snapshot_expiration_duration: Duration,
+    timestamp_expiration_duration: Duration,
+    _pouf: PhantomData<D>,
 }
 
-impl<'a, D, R> RepoContext<'a, D, R>
+impl<D, R> RepoContext<'_, D, R>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
     R: RepositoryStorage<D>,
 {
     fn root_keys_changed(&self, root: &Verified<RootMetadata>) -> bool {
@@ -280,18 +290,68 @@ where
 
         false
     }
+
+    /// The initial version number for non-root metadata.
+    fn non_root_initial_version(&self) -> MetadataVersion {
+        self.time_version.unwrap_or(MetadataVersion::ONE)
+    }
+
+    /// If time versioning is enabled, this updates the current time version to match the current
+    /// time. It will disable time versioning if the current timestamp is less than or equal to
+    /// zero, or it is greater than max u64.
+    fn update_time_version(&mut self) {
+        // We can use the time version if it is greater than zero and less than max u64. Otherwise
+        // fall back to default monontonic versioning.
+        let timestamp = self.current_time.timestamp();
+        if timestamp > 0 {
+            self.time_version = u64::try_from(timestamp)
+                .ok()
+                .and_then(NonZeroU64::new)
+                .map(MetadataVersion::new);
+        } else {
+            self.time_version = None;
+        }
+    }
+
+    /// The next version number for non-root metadata.
+    fn non_root_next_version(
+        &self,
+        current_version: MetadataVersion,
+        path: fn() -> MetadataPath,
+    ) -> Result<MetadataVersion> {
+        if let Some(time_version) = self.time_version {
+            // We can only use the time version if it's larger than our current version. If not,
+            // then fall back to the next version.
+            if current_version < time_version {
+                return Ok(time_version);
+            }
+        }
+
+        current_version
+            .checked_add(1)
+            .ok_or_else(|| Error::MetadataVersionMustBeSmallerThanMaxU64(path()))
+    }
 }
 
 fn sign<'a, D, I, M>(meta: &M, keys: I) -> Result<RawSignedMetadata<D, M>>
 where
-    D: DataInterchange,
+    D: Pouf,
     M: Metadata,
     I: IntoIterator<Item = &'a &'a dyn PrivateKey>,
 {
     // Sign the root.
     let mut signed_builder = SignedMetadataBuilder::<D, _>::from_metadata(meta)?;
+    let mut has_key = false;
     for key in keys {
+        has_key = true;
         signed_builder = signed_builder.sign(*key)?;
+    }
+
+    // We need at least one private key to sign the metadata.
+    if !has_key {
+        return Err(Error::MissingPrivateKey {
+            role: M::ROLE.into(),
+        });
     }
 
     signed_builder.build().to_raw()
@@ -300,7 +360,7 @@ where
 /// This helper builder simplifies the process of creating new metadata.
 pub struct RepoBuilder<'a, D, R, S = Root>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
     R: RepositoryStorage<D>,
     S: State,
 {
@@ -310,7 +370,7 @@ where
 
 impl<'a, D, R> RepoBuilder<'a, D, R, Root>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
     R: RepositoryStorage<D>,
 {
     /// Create a [RepoBuilder] for creating metadata for a new repository.
@@ -321,7 +381,7 @@ where
     /// # use {
     /// #     futures_executor::block_on,
     /// #     tuf::{
-    /// #         interchange::Json,
+    /// #         pouf::Pouf1,
     /// #         crypto::Ed25519PrivateKey,
     /// #         repo_builder::RepoBuilder,
     /// #         repository::EphemeralRepository,
@@ -333,7 +393,7 @@ where
     /// # ).unwrap();
     /// #
     /// # block_on(async {
-    /// let mut repo = EphemeralRepository::<Json>::new();
+    /// let mut repo = EphemeralRepository::<Pouf1>::new();
     /// let _metadata = RepoBuilder::create(&mut repo)
     ///     .trusted_root_keys(&[&key])
     ///     .trusted_targets_keys(&[&key])
@@ -358,15 +418,20 @@ where
                 trusted_targets_keys: vec![],
                 trusted_snapshot_keys: vec![],
                 trusted_timestamp_keys: vec![],
-                _interchange: PhantomData,
+                time_version: None,
+                root_expiration_duration: DEFAULT_ROOT_EXPIRATION,
+                targets_expiration_duration: DEFAULT_TARGETS_EXPIRATION,
+                snapshot_expiration_duration: DEFAULT_SNAPSHOT_EXPIRATION,
+                timestamp_expiration_duration: DEFAULT_TIMESTAMP_EXPIRATION,
+                _pouf: PhantomData,
             },
             state: Root {
                 builder: RootMetadataBuilder::new()
                     .consistent_snapshot(true)
-                    .root_threshold(1)
-                    .targets_threshold(1)
-                    .snapshot_threshold(1)
-                    .timestamp_threshold(1),
+                    .root_threshold(MetadataThreshold::ONE)
+                    .targets_threshold(MetadataThreshold::ONE)
+                    .snapshot_threshold(MetadataThreshold::ONE)
+                    .timestamp_threshold(MetadataThreshold::ONE),
             },
         }
     }
@@ -382,7 +447,7 @@ where
     /// #     tuf::{
     /// #         database::Database,
     /// #         crypto::Ed25519PrivateKey,
-    /// #         interchange::Json,
+    /// #         pouf::Pouf1,
     /// #         repo_builder::RepoBuilder,
     /// #         repository::EphemeralRepository,
     /// #     },
@@ -393,7 +458,7 @@ where
     /// # ).unwrap();
     /// #
     /// # block_on(async {
-    ///  let mut repo = EphemeralRepository::<Json>::new();
+    ///  let mut repo = EphemeralRepository::<Pouf1>::new();
     ///  let metadata1 = RepoBuilder::create(&mut repo)
     ///     .trusted_root_keys(&[&key])
     ///     .trusted_targets_keys(&[&key])
@@ -442,7 +507,12 @@ where
                 trusted_targets_keys: vec![],
                 trusted_snapshot_keys: vec![],
                 trusted_timestamp_keys: vec![],
-                _interchange: PhantomData,
+                time_version: None,
+                root_expiration_duration: DEFAULT_ROOT_EXPIRATION,
+                targets_expiration_duration: DEFAULT_TARGETS_EXPIRATION,
+                snapshot_expiration_duration: DEFAULT_SNAPSHOT_EXPIRATION,
+                timestamp_expiration_duration: DEFAULT_TIMESTAMP_EXPIRATION,
+                _pouf: PhantomData,
             },
             state: Root { builder },
         }
@@ -454,6 +524,72 @@ where
     /// Default is the current wall clock time in UTC.
     pub fn current_time(mut self, current_time: DateTime<Utc>) -> Self {
         self.ctx.current_time = current_time;
+
+        // Update our time version if enabled.
+        if self.ctx.time_version.is_some() {
+            self.ctx.update_time_version();
+        }
+
+        self
+    }
+
+    /// Create Non-root metadata based off the current UTC timestamp, instead of a monotonic
+    /// increment.
+    pub fn time_versioning(mut self, time_versioning: bool) -> Self {
+        if time_versioning {
+            self.ctx.update_time_version();
+        } else {
+            self.ctx.time_version = None;
+        }
+        self
+    }
+
+    /// Sets that the root metadata will expire after this duration past the current time.
+    ///
+    /// Defaults to 365 days.
+    ///
+    /// Note: calling this function will only change what is the metadata expiration we'll use if we
+    /// create a new root metadata if we call [RepoBuilder::stage_root], or we decide a new one is
+    /// needed when we call [RepoBuilder::stage_root_if_necessary].
+    pub fn root_expiration_duration(mut self, duration: Duration) -> Self {
+        self.ctx.root_expiration_duration = duration;
+        self
+    }
+
+    /// Sets that the targets metadata will expire after after this duration past the current time.
+    ///
+    /// Defaults to 90 days.
+    ///
+    /// Note: calling this function will only change what is the metadata expiration we'll use if we
+    /// create a new targets metadata if we call [RepoBuilder::stage_targets], or we decide a new
+    /// one is needed when we call [RepoBuilder::stage_targets_if_necessary].
+    pub fn targets_expiration_duration(mut self, duration: Duration) -> Self {
+        self.ctx.targets_expiration_duration = duration;
+        self
+    }
+
+    /// Sets that the snapshot metadata will expire after after this duration past the current time.
+    ///
+    /// Defaults to 7 days.
+    ///
+    /// Note: calling this function will only change what is the metadata expiration we'll use if we
+    /// create a new snapshot metadata if we call [RepoBuilder::stage_snapshot], or we decide a new
+    /// one is needed when we call [RepoBuilder::stage_snapshot_if_necessary].
+    pub fn snapshot_expiration_duration(mut self, duration: Duration) -> Self {
+        self.ctx.snapshot_expiration_duration = duration;
+        self
+    }
+
+    /// Sets that the timestamp metadata will expire after after this duration past the current
+    /// time.
+    ///
+    /// Defaults to 1 day.
+    ///
+    /// Note: calling this function will only change what is the metadata expiration we'll use if we
+    /// create a new timestamp metadata if we call [RepoBuilder::stage_timestamp], or we decide a
+    /// new one is needed when we call [RepoBuilder::stage_timestamp_if_necessary].
+    pub fn timestamp_expiration_duration(mut self, duration: Duration) -> Self {
+        self.ctx.timestamp_expiration_duration = duration;
         self
     }
 
@@ -612,14 +748,14 @@ where
                 Error::MetadataVersionMustBeSmallerThanMaxU64(MetadataPath::root())
             })?
         } else {
-            1
+            MetadataVersion::ONE
         };
 
         let root_builder = self
             .state
             .builder
             .version(next_version)
-            .expires(self.ctx.current_time + Duration::days(365));
+            .expires(self.ctx.current_time + self.ctx.root_expiration_duration);
         let root = f(root_builder).build()?;
 
         let raw_root = sign(
@@ -644,7 +780,7 @@ where
     ///
     /// This will hash the file with [HashAlgorithm::Sha256].
     ///
-    /// See [RepoBuilder<Targets>::add_target] for more details.
+    /// See `RepoBuilder<Targets>::add_target` for more details.
     pub async fn add_target<Rd>(
         self,
         target_path: TargetPath,
@@ -696,7 +832,7 @@ where
 
 impl<'a, D, R> RepoBuilder<'a, D, R, Targets<D>>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
     R: RepositoryStorage<D>,
 {
     /// Whether or not to include the length of the targets, and any delegated targets, in the
@@ -778,7 +914,7 @@ where
         } else {
             return Err(Error::MetadataNotFound {
                 path: MetadataPath::root(),
-                version: MetadataVersion::None,
+                version: None,
             });
         };
 
@@ -840,13 +976,15 @@ where
     where
         F: FnOnce(TargetsMetadataBuilder) -> TargetsMetadataBuilder,
     {
-        let mut targets_builder = TargetsMetadataBuilder::new();
+        let mut targets_builder = TargetsMetadataBuilder::new()
+            .expires(self.ctx.current_time + self.ctx.targets_expiration_duration);
+
         let mut delegations_builder = DelegationsBuilder::new();
 
         if let Some(trusted_targets) = self.ctx.db.and_then(|db| db.trusted_targets()) {
-            let next_version = trusted_targets.version().checked_add(1).ok_or_else(|| {
-                Error::MetadataVersionMustBeSmallerThanMaxU64(MetadataPath::targets())
-            })?;
+            let next_version = self
+                .ctx
+                .non_root_next_version(trusted_targets.version(), MetadataPath::targets)?;
 
             targets_builder = targets_builder.version(next_version);
 
@@ -865,6 +1003,8 @@ where
                     delegations_builder = delegations_builder.role(role.clone());
                 }
             }
+        } else {
+            targets_builder = targets_builder.version(self.ctx.non_root_initial_version());
         }
 
         // Overwrite any of the old targets with the new ones.
@@ -917,17 +1057,6 @@ where
         self.stage_targets_if_necessary()?.commit().await
     }
 
-    /// Commit the metadata for this repository without validating it.
-    ///
-    /// Warning: This can write invalid metadata to a repository without
-    /// validating that it is correct.
-    #[cfg(test)]
-    pub async fn commit_skip_validation(self) -> Result<RawSignedMetadataSet<D>> {
-        self.stage_targets_if_necessary()?
-            .commit_skip_validation()
-            .await
-    }
-
     fn need_new_targets(&self) -> bool {
         // We need a new targets metadata if we added any targets.
         if !self.state.targets.is_empty() {
@@ -965,7 +1094,7 @@ where
 
 impl<'a, D, R> RepoBuilder<'a, D, R, Snapshot<D>>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
     R: RepositoryStorage<D>,
 {
     /// Whether or not to include the length of the targets, and any delegated targets, in the
@@ -1031,13 +1160,13 @@ where
     where
         F: FnOnce(SnapshotMetadataBuilder) -> SnapshotMetadataBuilder,
     {
-        let mut snapshot_builder =
-            SnapshotMetadataBuilder::new().expires(self.ctx.current_time + Duration::days(7));
+        let mut snapshot_builder = SnapshotMetadataBuilder::new()
+            .expires(self.ctx.current_time + self.ctx.snapshot_expiration_duration);
 
         if let Some(trusted_snapshot) = self.ctx.db.and_then(|db| db.trusted_snapshot()) {
-            let next_version = trusted_snapshot.version().checked_add(1).ok_or_else(|| {
-                Error::MetadataVersionMustBeSmallerThanMaxU64(MetadataPath::snapshot())
-            })?;
+            let next_version = self
+                .ctx
+                .non_root_next_version(trusted_snapshot.version(), MetadataPath::snapshot)?;
 
             snapshot_builder = snapshot_builder.version(next_version);
 
@@ -1048,6 +1177,8 @@ where
                         .insert_metadata_description(path.clone(), description.clone());
                 }
             }
+        } else {
+            snapshot_builder = snapshot_builder.version(self.ctx.non_root_initial_version());
         }
 
         // Overwrite the targets entry if specified.
@@ -1084,17 +1215,6 @@ where
     /// See [RepoBuilder::commit](#method.commit-4) for more details.
     pub async fn commit(self) -> Result<RawSignedMetadataSet<D>> {
         self.stage_snapshot_if_necessary()?.commit().await
-    }
-
-    /// Commit the metadata for this repository without validating it.
-    ///
-    /// Warning: This can write invalid metadata to a repository without
-    /// validating that it is correct.
-    #[cfg(test)]
-    pub async fn commit_skip_validation(self) -> Result<RawSignedMetadataSet<D>> {
-        self.stage_snapshot_if_necessary()?
-            .commit_skip_validation()
-            .await
     }
 
     fn need_new_snapshot(&self) -> bool {
@@ -1134,7 +1254,7 @@ where
 
 impl<'a, D, R> RepoBuilder<'a, D, R, Timestamp<D>>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
     R: RepositoryStorage<D>,
 {
     /// Whether or not to include the length of the snapshot, and any delegated snapshot, in the
@@ -1200,14 +1320,13 @@ where
     {
         let next_version = if let Some(db) = self.ctx.db {
             if let Some(trusted_timestamp) = db.trusted_timestamp() {
-                trusted_timestamp.version().checked_add(1).ok_or_else(|| {
-                    Error::MetadataVersionMustBeSmallerThanMaxU64(MetadataPath::timestamp())
-                })?
+                self.ctx
+                    .non_root_next_version(trusted_timestamp.version(), MetadataPath::timestamp)?
             } else {
-                1
+                self.ctx.non_root_initial_version()
             }
         } else {
-            1
+            self.ctx.non_root_initial_version()
         };
 
         let description = if let Some(description) = self.state.snapshot_description()? {
@@ -1219,13 +1338,13 @@ where
                 .map(|timestamp| timestamp.snapshot().clone())
                 .ok_or_else(|| Error::MetadataNotFound {
                     path: MetadataPath::snapshot(),
-                    version: MetadataVersion::None,
+                    version: None,
                 })?
         };
 
         let timestamp_builder = TimestampMetadataBuilder::from_metadata_description(description)
             .version(next_version)
-            .expires(self.ctx.current_time + Duration::days(1));
+            .expires(self.ctx.current_time + self.ctx.timestamp_expiration_duration);
 
         let timestamp = f(timestamp_builder).build()?;
         let raw_timestamp = sign(
@@ -1253,17 +1372,6 @@ where
     /// See [RepoBuilder::commit](#method.commit-4) for more details.
     pub async fn commit(self) -> Result<RawSignedMetadataSet<D>> {
         self.stage_timestamp_if_necessary()?.commit().await
-    }
-
-    /// Commit the metadata for this repository without validating it.
-    ///
-    /// Warning: This can write invalid metadata to a repository without
-    /// validating that it is correct.
-    #[cfg(test)]
-    pub async fn commit_skip_validation(self) -> Result<RawSignedMetadataSet<D>> {
-        self.stage_timestamp_if_necessary()?
-            .commit_skip_validation()
-            .await
     }
 
     fn need_new_timestamp(&self) -> bool {
@@ -1301,9 +1409,9 @@ where
     }
 }
 
-impl<'a, D, R> RepoBuilder<'a, D, R, Done<D>>
+impl<D, R> RepoBuilder<'_, D, R, Done<D>>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
     R: RepositoryStorage<D>,
 {
     /// Commit the metadata for this repository, then write all metadata to the repository. Before
@@ -1312,23 +1420,7 @@ where
     pub async fn commit(mut self) -> Result<RawSignedMetadataSet<D>> {
         self.validate_built_metadata()?;
         self.write_repo().await?;
-        Ok(self.build_skip_validation())
-    }
 
-    /// Commit the metadata for this repository without validating it.
-    ///
-    /// Warning: This can write invalid metadata to a repository without validating that it is
-    /// correct.
-    #[cfg(test)]
-    pub async fn commit_skip_validation(mut self) -> Result<RawSignedMetadataSet<D>> {
-        self.write_repo().await?;
-        Ok(self.build_skip_validation())
-    }
-
-    /// Build the metadata without validating it for correctness.
-    ///
-    /// Warning: This can produce invalid metadata.
-    fn build_skip_validation(self) -> RawSignedMetadataSet<D> {
         let mut builder = RawSignedMetadataSetBuilder::new();
 
         if let Some(root) = self.state.staged_root {
@@ -1347,7 +1439,7 @@ where
             builder = builder.timestamp(timestamp.raw);
         }
 
-        builder.build()
+        Ok(builder.build())
     }
 
     /// Before we commit any metadata, make sure that we can update from our
@@ -1369,7 +1461,7 @@ where
         } else {
             return Err(Error::MetadataNotFound {
                 path: MetadataPath::root(),
-                version: MetadataVersion::None,
+                version: None,
             });
         };
 
@@ -1394,18 +1486,14 @@ where
                 .repo
                 .store_metadata(
                     &MetadataPath::root(),
-                    MetadataVersion::Number(root.metadata.version()),
+                    Some(root.metadata.version()),
                     &mut root.raw.as_bytes(),
                 )
                 .await?;
 
             self.ctx
                 .repo
-                .store_metadata(
-                    &MetadataPath::root(),
-                    MetadataVersion::None,
-                    &mut root.raw.as_bytes(),
-                )
+                .store_metadata(&MetadataPath::root(), None, &mut root.raw.as_bytes())
                 .await?;
 
             root.metadata.consistent_snapshot()
@@ -1414,7 +1502,7 @@ where
         } else {
             return Err(Error::MetadataNotFound {
                 path: MetadataPath::root(),
-                version: MetadataVersion::None,
+                version: None,
             });
         };
 
@@ -1422,7 +1510,7 @@ where
             let path = MetadataPath::targets();
             self.ctx
                 .repo
-                .store_metadata(&path, MetadataVersion::None, &mut targets.raw.as_bytes())
+                .store_metadata(&path.clone(), None, &mut targets.raw.as_bytes())
                 .await?;
 
             if consistent_snapshot {
@@ -1430,7 +1518,7 @@ where
                     .repo
                     .store_metadata(
                         &path,
-                        MetadataVersion::Number(targets.metadata.version()),
+                        Some(targets.metadata.version()),
                         &mut targets.raw.as_bytes(),
                     )
                     .await?;
@@ -1441,7 +1529,7 @@ where
             let path = MetadataPath::snapshot();
             self.ctx
                 .repo
-                .store_metadata(&path, MetadataVersion::None, &mut snapshot.raw.as_bytes())
+                .store_metadata(&path, None, &mut snapshot.raw.as_bytes())
                 .await?;
 
             if consistent_snapshot {
@@ -1449,7 +1537,7 @@ where
                     .repo
                     .store_metadata(
                         &path,
-                        MetadataVersion::Number(snapshot.metadata.version()),
+                        Some(snapshot.metadata.version()),
                         &mut snapshot.raw.as_bytes(),
                     )
                     .await?;
@@ -1461,7 +1549,7 @@ where
                 .repo
                 .store_metadata(
                     &MetadataPath::timestamp(),
-                    MetadataVersion::None,
+                    None,
                     &mut timestamp.raw.as_bytes(),
                 )
                 .await?;
@@ -1473,70 +1561,68 @@ where
 
 #[cfg(test)]
 mod tests {
-    use chrono::NaiveDateTime;
-
-    use crate::repository::RepositoryProvider;
-
     use {
         super::*,
         crate::{
             client::{Client, Config},
             crypto::Ed25519PrivateKey,
-            interchange::Json,
-            metadata::SignedMetadata,
-            repository::EphemeralRepository,
+            metadata::{MetadataThreshold, SignedMetadata},
+            pouf::Pouf1,
+            repository::{EphemeralRepository, RepositoryProvider},
         },
         assert_matches::assert_matches,
         chrono::{
-            offset::{TimeZone as _, Utc},
             DateTime,
+            offset::{TimeZone as _, Utc},
         },
         futures_executor::block_on,
         futures_util::io::{AsyncReadExt, Cursor},
-        lazy_static::lazy_static,
         maplit::hashmap,
         pretty_assertions::assert_eq,
-        std::collections::BTreeMap,
+        std::{collections::BTreeMap, num::NonZeroU32, sync::LazyLock},
     };
 
-    lazy_static! {
-        static ref KEYS: Vec<Ed25519PrivateKey> = {
-            let keys: &[&[u8]] = &[
-                include_bytes!("../tests/ed25519/ed25519-1.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-2.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-3.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-4.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-5.pk8.der"),
-                include_bytes!("../tests/ed25519/ed25519-6.pk8.der"),
-            ];
-            keys.iter()
-                .map(|b| Ed25519PrivateKey::from_pkcs8(b).unwrap())
-                .collect()
-        };
-    }
+    const TWO: NonZeroU32 = NonZeroU32::new(2).unwrap();
+    const THREE: NonZeroU32 = NonZeroU32::new(3).unwrap();
+    const FOUR: NonZeroU32 = NonZeroU32::new(4).unwrap();
+    const FIVE: NonZeroU32 = NonZeroU32::new(5).unwrap();
+
+    static KEYS: LazyLock<Vec<Ed25519PrivateKey>> = LazyLock::new(|| {
+        let keys: &[&[u8]] = &[
+            include_bytes!("../tests/ed25519/ed25519-1.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-2.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-3.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-4.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-5.pk8.der"),
+            include_bytes!("../tests/ed25519/ed25519-6.pk8.der"),
+        ];
+        keys.iter()
+            .map(|b| Ed25519PrivateKey::from_pkcs8(b).unwrap())
+            .collect()
+    });
 
     fn create_root(
-        version: u64,
+        version: MetadataVersion,
         consistent_snapshot: bool,
         expires: DateTime<Utc>,
-    ) -> SignedMetadata<Json, RootMetadata> {
+    ) -> SignedMetadata<Pouf1, RootMetadata> {
         let root = RootMetadataBuilder::new()
             .version(version)
             .consistent_snapshot(consistent_snapshot)
             .expires(expires)
-            .root_threshold(2)
+            .root_threshold(TWO)
             .root_key(KEYS[0].public().clone())
             .root_key(KEYS[1].public().clone())
             .root_key(KEYS[2].public().clone())
-            .targets_threshold(2)
+            .targets_threshold(TWO)
             .targets_key(KEYS[1].public().clone())
             .targets_key(KEYS[2].public().clone())
             .targets_key(KEYS[3].public().clone())
-            .snapshot_threshold(2)
+            .snapshot_threshold(TWO)
             .snapshot_key(KEYS[2].public().clone())
             .snapshot_key(KEYS[3].public().clone())
             .snapshot_key(KEYS[4].public().clone())
-            .timestamp_threshold(2)
+            .timestamp_threshold(TWO)
             .timestamp_key(KEYS[3].public().clone())
             .timestamp_key(KEYS[4].public().clone())
             .timestamp_key(KEYS[5].public().clone())
@@ -1555,15 +1641,15 @@ mod tests {
     }
 
     fn create_targets(
-        version: u64,
+        version: MetadataVersion,
         expires: DateTime<Utc>,
-    ) -> SignedMetadata<Json, TargetsMetadata> {
+    ) -> SignedMetadata<Pouf1, TargetsMetadata> {
         let targets = TargetsMetadataBuilder::new()
             .version(version)
             .expires(expires)
             .build()
             .unwrap();
-        SignedMetadataBuilder::<Json, _>::from_metadata(&targets)
+        SignedMetadataBuilder::<Pouf1, _>::from_metadata(&targets)
             .unwrap()
             .sign(&KEYS[1])
             .unwrap()
@@ -1575,11 +1661,11 @@ mod tests {
     }
 
     fn create_snapshot(
-        version: u64,
+        version: MetadataVersion,
         expires: DateTime<Utc>,
-        targets: &SignedMetadata<Json, TargetsMetadata>,
+        targets: &SignedMetadata<Pouf1, TargetsMetadata>,
         include_length_and_hashes: bool,
-    ) -> SignedMetadata<Json, SnapshotMetadata> {
+    ) -> SignedMetadata<Pouf1, SnapshotMetadata> {
         let description = if include_length_and_hashes {
             let raw_targets = targets.to_raw().unwrap();
             let hashes = crypto::calculate_hashes_from_slice(
@@ -1599,7 +1685,7 @@ mod tests {
             .expires(expires)
             .build()
             .unwrap();
-        SignedMetadataBuilder::<Json, _>::from_metadata(&snapshot)
+        SignedMetadataBuilder::<Pouf1, _>::from_metadata(&snapshot)
             .unwrap()
             .sign(&KEYS[2])
             .unwrap()
@@ -1611,11 +1697,11 @@ mod tests {
     }
 
     fn create_timestamp(
-        version: u64,
+        version: MetadataVersion,
         expires: DateTime<Utc>,
-        snapshot: &SignedMetadata<Json, SnapshotMetadata>,
+        snapshot: &SignedMetadata<Pouf1, SnapshotMetadata>,
         include_length_and_hashes: bool,
-    ) -> SignedMetadata<Json, TimestampMetadata> {
+    ) -> SignedMetadata<Pouf1, TimestampMetadata> {
         let description = if include_length_and_hashes {
             let raw_snapshot = snapshot.to_raw().unwrap();
             let hashes = crypto::calculate_hashes_from_slice(
@@ -1634,7 +1720,7 @@ mod tests {
             .expires(expires)
             .build()
             .unwrap();
-        SignedMetadataBuilder::<Json, _>::from_metadata(&timestamp)
+        SignedMetadataBuilder::<Pouf1, _>::from_metadata(&timestamp)
             .unwrap()
             .sign(&KEYS[3])
             .unwrap()
@@ -1646,11 +1732,11 @@ mod tests {
     }
 
     fn assert_metadata(
-        metadata: &RawSignedMetadataSet<Json>,
-        expected_root: Option<&RawSignedMetadata<Json, RootMetadata>>,
-        expected_targets: Option<&RawSignedMetadata<Json, TargetsMetadata>>,
-        expected_snapshot: Option<&RawSignedMetadata<Json, SnapshotMetadata>>,
-        expected_timestamp: Option<&RawSignedMetadata<Json, TimestampMetadata>>,
+        metadata: &RawSignedMetadataSet<Pouf1>,
+        expected_root: Option<&RawSignedMetadata<Pouf1, RootMetadata>>,
+        expected_targets: Option<&RawSignedMetadata<Pouf1, TargetsMetadata>>,
+        expected_snapshot: Option<&RawSignedMetadata<Pouf1, SnapshotMetadata>>,
+        expected_timestamp: Option<&RawSignedMetadata<Pouf1, TimestampMetadata>>,
     ) {
         assert_eq!(
             metadata.root().map(|m| m.parse_untrusted().unwrap()),
@@ -1671,8 +1757,8 @@ mod tests {
     }
 
     fn assert_repo(
-        repo: &EphemeralRepository<Json>,
-        expected_metadata: &BTreeMap<(MetadataPath, MetadataVersion), &[u8]>,
+        repo: &EphemeralRepository<Pouf1>,
+        expected_metadata: &BTreeMap<(MetadataPath, Option<MetadataVersion>), &[u8]>,
     ) {
         let actual_metadata = repo
             .metadata()
@@ -1704,10 +1790,10 @@ mod tests {
 
     async fn check_stage_and_update_repo(consistent_snapshot: bool) {
         // We'll write all the metadata to this remote repository.
-        let mut remote = EphemeralRepository::<Json>::new();
+        let mut remote = EphemeralRepository::<Pouf1>::new();
 
         // First, create the metadata.
-        let expires1 = Utc.ymd(2038, 1, 1).and_hms(0, 0, 0);
+        let expires1 = Utc.with_ymd_and_hms(2038, 1, 1, 0, 0, 0).unwrap();
         let metadata1 = RepoBuilder::create(&mut remote)
             .trusted_root_keys(&[&KEYS[0], &KEYS[1], &KEYS[2]])
             .trusted_targets_keys(&[&KEYS[1], &KEYS[2], &KEYS[3]])
@@ -1717,10 +1803,10 @@ mod tests {
                 builder
                     .expires(expires1)
                     .consistent_snapshot(consistent_snapshot)
-                    .root_threshold(2)
-                    .targets_threshold(2)
-                    .snapshot_threshold(2)
-                    .timestamp_threshold(2)
+                    .root_threshold(TWO)
+                    .targets_threshold(TWO)
+                    .snapshot_threshold(TWO)
+                    .timestamp_threshold(TWO)
             })
             .unwrap()
             .stage_targets_with_builder(|builder| builder.expires(expires1))
@@ -1739,10 +1825,12 @@ mod tests {
 
         // Generate the expected metadata by hand, and make sure we produced
         // what we expected.
-        let signed_root1 = create_root(1, consistent_snapshot, expires1);
-        let signed_targets1 = create_targets(1, expires1);
-        let signed_snapshot1 = create_snapshot(1, expires1, &signed_targets1, true);
-        let signed_timestamp1 = create_timestamp(1, expires1, &signed_snapshot1, true);
+        let signed_root1 = create_root(MetadataVersion::ONE, consistent_snapshot, expires1);
+        let signed_targets1 = create_targets(MetadataVersion::ONE, expires1);
+        let signed_snapshot1 =
+            create_snapshot(MetadataVersion::ONE, expires1, &signed_targets1, true);
+        let signed_timestamp1 =
+            create_timestamp(MetadataVersion::ONE, expires1, &signed_snapshot1, true);
 
         let raw_root1 = signed_root1.to_raw().unwrap();
         let raw_targets1 = signed_targets1.to_raw().unwrap();
@@ -1760,25 +1848,13 @@ mod tests {
         // Make sure we stored the metadata correctly.
         let mut expected_metadata: BTreeMap<_, _> = vec![
             (
-                (MetadataPath::root(), MetadataVersion::Number(1)),
+                (MetadataPath::root(), Some(MetadataVersion::ONE)),
                 raw_root1.as_bytes(),
             ),
-            (
-                (MetadataPath::root(), MetadataVersion::None),
-                raw_root1.as_bytes(),
-            ),
-            (
-                (MetadataPath::targets(), MetadataVersion::None),
-                raw_targets1.as_bytes(),
-            ),
-            (
-                (MetadataPath::snapshot(), MetadataVersion::None),
-                raw_snapshot1.as_bytes(),
-            ),
-            (
-                (MetadataPath::timestamp(), MetadataVersion::None),
-                raw_timestamp1.as_bytes(),
-            ),
+            ((MetadataPath::root(), None), raw_root1.as_bytes()),
+            ((MetadataPath::targets(), None), raw_targets1.as_bytes()),
+            ((MetadataPath::snapshot(), None), raw_snapshot1.as_bytes()),
+            ((MetadataPath::timestamp(), None), raw_timestamp1.as_bytes()),
         ]
         .into_iter()
         .collect();
@@ -1786,11 +1862,11 @@ mod tests {
         if consistent_snapshot {
             expected_metadata.extend(vec![
                 (
-                    (MetadataPath::targets(), MetadataVersion::Number(1)),
+                    (MetadataPath::targets(), Some(MetadataVersion::ONE)),
                     raw_targets1.as_bytes(),
                 ),
                 (
-                    (MetadataPath::snapshot(), MetadataVersion::Number(1)),
+                    (MetadataPath::snapshot(), Some(MetadataVersion::ONE)),
                     raw_snapshot1.as_bytes(),
                 ),
             ]);
@@ -1809,23 +1885,26 @@ mod tests {
         .await
         .unwrap();
         client.update().await.unwrap();
-        assert_eq!(client.database().trusted_root().version(), 1);
+        assert_eq!(
+            client.database().trusted_root().version(),
+            MetadataVersion::ONE
+        );
         assert_eq!(
             client.database().trusted_targets().map(|m| m.version()),
-            Some(1)
+            Some(MetadataVersion::ONE)
         );
         assert_eq!(
             client.database().trusted_snapshot().map(|m| m.version()),
-            Some(1)
+            Some(MetadataVersion::ONE)
         );
         assert_eq!(
             client.database().trusted_timestamp().map(|m| m.version()),
-            Some(1)
+            Some(MetadataVersion::ONE)
         );
 
         // Create a new metadata, derived from the tuf database we created
         // with the client.
-        let expires2 = Utc.ymd(2038, 1, 2).and_hms(0, 0, 0);
+        let expires2 = Utc.with_ymd_and_hms(2038, 1, 2, 0, 0, 0).unwrap();
         let mut parts = client.into_parts();
         let metadata2 = RepoBuilder::from_database(&mut parts.remote, &parts.database)
             .trusted_root_keys(&[&KEYS[0], &KEYS[1], &KEYS[2]])
@@ -1849,10 +1928,10 @@ mod tests {
             .unwrap();
 
         // Make sure the new metadata was generated as expected.
-        let signed_root2 = create_root(2, consistent_snapshot, expires2);
-        let signed_targets2 = create_targets(2, expires2);
-        let signed_snapshot2 = create_snapshot(2, expires2, &signed_targets2, false);
-        let signed_timestamp2 = create_timestamp(2, expires2, &signed_snapshot2, false);
+        let signed_root2 = create_root(TWO.into(), consistent_snapshot, expires2);
+        let signed_targets2 = create_targets(TWO.into(), expires2);
+        let signed_snapshot2 = create_snapshot(TWO.into(), expires2, &signed_targets2, false);
+        let signed_timestamp2 = create_timestamp(TWO.into(), expires2, &signed_snapshot2, false);
 
         let raw_root2 = signed_root2.to_raw().unwrap();
         let raw_targets2 = signed_targets2.to_raw().unwrap();
@@ -1870,35 +1949,23 @@ mod tests {
         // Check that the new metadata was written.
         expected_metadata.extend(vec![
             (
-                (MetadataPath::root(), MetadataVersion::Number(2)),
+                (MetadataPath::root(), Some(TWO.into())),
                 raw_root2.as_bytes(),
             ),
-            (
-                (MetadataPath::root(), MetadataVersion::None),
-                raw_root2.as_bytes(),
-            ),
-            (
-                (MetadataPath::targets(), MetadataVersion::None),
-                raw_targets2.as_bytes(),
-            ),
-            (
-                (MetadataPath::snapshot(), MetadataVersion::None),
-                raw_snapshot2.as_bytes(),
-            ),
-            (
-                (MetadataPath::timestamp(), MetadataVersion::None),
-                raw_timestamp2.as_bytes(),
-            ),
+            ((MetadataPath::root(), None), raw_root2.as_bytes()),
+            ((MetadataPath::targets(), None), raw_targets2.as_bytes()),
+            ((MetadataPath::snapshot(), None), raw_snapshot2.as_bytes()),
+            ((MetadataPath::timestamp(), None), raw_timestamp2.as_bytes()),
         ]);
 
         if consistent_snapshot {
             expected_metadata.extend(vec![
                 (
-                    (MetadataPath::targets(), MetadataVersion::Number(2)),
+                    (MetadataPath::targets(), Some(TWO.into())),
                     raw_targets2.as_bytes(),
                 ),
                 (
-                    (MetadataPath::snapshot(), MetadataVersion::Number(2)),
+                    (MetadataPath::snapshot(), Some(TWO.into())),
                     raw_snapshot2.as_bytes(),
                 ),
             ]);
@@ -1909,18 +1976,18 @@ mod tests {
         // And make sure the client can update to the latest metadata.
         let mut client = Client::from_parts(parts);
         client.update().await.unwrap();
-        assert_eq!(client.database().trusted_root().version(), 2);
+        assert_eq!(client.database().trusted_root().version(), TWO.into());
         assert_eq!(
             client.database().trusted_targets().map(|m| m.version()),
-            Some(2)
+            Some(TWO.into())
         );
         assert_eq!(
             client.database().trusted_snapshot().map(|m| m.version()),
-            Some(2)
+            Some(TWO.into())
         );
         assert_eq!(
             client.database().trusted_timestamp().map(|m| m.version()),
-            Some(2)
+            Some(TWO.into())
         );
     }
 
@@ -1935,7 +2002,7 @@ mod tests {
     }
 
     async fn commit_does_nothing_if_nothing_changed(consistent_snapshot: bool) {
-        let mut repo = EphemeralRepository::<Json>::new();
+        let mut repo = EphemeralRepository::<Pouf1>::new();
         let metadata1 = RepoBuilder::create(&mut repo)
             .trusted_root_keys(&[&KEYS[0]])
             .trusted_targets_keys(&[&KEYS[0]])
@@ -1958,7 +2025,10 @@ mod tests {
         .unwrap();
 
         assert!(client.update().await.unwrap());
-        assert_eq!(client.database().trusted_root().version(), 1);
+        assert_eq!(
+            client.database().trusted_root().version(),
+            MetadataVersion::ONE
+        );
 
         // Make sure doing another commit makes no changes.
         let mut parts = client.into_parts();
@@ -1975,7 +2045,10 @@ mod tests {
 
         let mut client = Client::from_parts(parts);
         assert!(!client.update().await.unwrap());
-        assert_eq!(client.database().trusted_root().version(), 1);
+        assert_eq!(
+            client.database().trusted_root().version(),
+            MetadataVersion::ONE
+        );
     }
 
     #[test]
@@ -1989,7 +2062,7 @@ mod tests {
     }
 
     async fn check_root_chain_update(consistent_snapshot: bool) {
-        let mut repo = EphemeralRepository::<Json>::new();
+        let mut repo = EphemeralRepository::<Pouf1>::new();
 
         // First, create the initial metadata. We initially sign the root
         // metadata with key 1.
@@ -2015,7 +2088,10 @@ mod tests {
         .unwrap();
 
         assert!(client.update().await.unwrap());
-        assert_eq!(client.database().trusted_root().version(), 1);
+        assert_eq!(
+            client.database().trusted_root().version(),
+            MetadataVersion::ONE
+        );
         assert_eq!(
             client
                 .database()
@@ -2027,7 +2103,10 @@ mod tests {
 
         // Another update should not fetch anything.
         assert!(!client.update().await.unwrap());
-        assert_eq!(client.database().trusted_root().version(), 1);
+        assert_eq!(
+            client.database().trusted_root().version(),
+            MetadataVersion::ONE
+        );
 
         // Now bump the root to version 2. We sign the root metadata with both
         // key 1 and 2, but the builder should only trust key 2.
@@ -2044,7 +2123,7 @@ mod tests {
 
         let mut client = Client::from_parts(parts);
         assert!(client.update().await.unwrap());
-        assert_eq!(client.database().trusted_root().version(), 2);
+        assert_eq!(client.database().trusted_root().version(), TWO.into());
         assert_eq!(
             client.database().trusted_root().consistent_snapshot(),
             consistent_snapshot
@@ -2060,7 +2139,7 @@ mod tests {
 
         // Another update should not fetch anything.
         assert!(!client.update().await.unwrap());
-        assert_eq!(client.database().trusted_root().version(), 2);
+        assert_eq!(client.database().trusted_root().version(), TWO.into());
 
         // Now bump the root to version 3. The metadata will only be signed with
         // key 2, and trusted by key 2.
@@ -2078,7 +2157,7 @@ mod tests {
 
         let mut client = Client::from_parts(parts);
         assert!(client.update().await.unwrap());
-        assert_eq!(client.database().trusted_root().version(), 3);
+        assert_eq!(client.database().trusted_root().version(), THREE.into());
         assert_eq!(
             client
                 .database()
@@ -2090,13 +2169,13 @@ mod tests {
 
         // Another update should not fetch anything.
         assert!(!client.update().await.unwrap());
-        assert_eq!(client.database().trusted_root().version(), 3);
+        assert_eq!(client.database().trusted_root().version(), THREE.into());
     }
 
     #[test]
     fn test_from_database_root_must_be_one_after_the_last() {
         block_on(async {
-            let mut repo = EphemeralRepository::<Json>::new();
+            let mut repo = EphemeralRepository::<Pouf1>::new();
             let metadata = RepoBuilder::create(&mut repo)
                 .trusted_root_keys(&[&KEYS[0]])
                 .trusted_targets_keys(&[&KEYS[0]])
@@ -2114,16 +2193,18 @@ mod tests {
                     .trusted_targets_keys(&[&KEYS[0]])
                     .trusted_snapshot_keys(&[&KEYS[0]])
                     .trusted_timestamp_keys(&[&KEYS[0]])
-                    .stage_root_with_builder(|builder| builder.version(3))
+                    .stage_root_with_builder(|builder| builder.version(THREE))
                     .unwrap()
                     .commit()
                     .await,
                 Err(Error::AttemptedMetadataRollBack {
                     role,
-                    trusted_version: 1,
-                    new_version: 3,
+                    trusted_version,
+                    new_version,
                 })
                 if role == MetadataPath::root()
+                    && trusted_version == MetadataVersion::ONE
+                    && new_version == THREE.into()
             );
         })
     }
@@ -2131,7 +2212,7 @@ mod tests {
     #[test]
     fn test_add_target_not_consistent_snapshot() {
         block_on(async move {
-            let mut repo = EphemeralRepository::<Json>::new();
+            let mut repo = EphemeralRepository::<Pouf1>::new();
 
             let hash_algs = &[HashAlgorithm::Sha256, HashAlgorithm::Sha512];
 
@@ -2225,7 +2306,7 @@ mod tests {
     #[test]
     fn test_add_target_consistent_snapshot() {
         block_on(async move {
-            let mut repo = EphemeralRepository::<Json>::new();
+            let mut repo = EphemeralRepository::<Pouf1>::new();
 
             let hash_algs = &[HashAlgorithm::Sha256, HashAlgorithm::Sha512];
 
@@ -2322,10 +2403,10 @@ mod tests {
     #[test]
     fn test_do_not_require_all_keys_to_be_online() {
         block_on(async {
-            let mut remote = EphemeralRepository::<Json>::new();
+            let mut remote = EphemeralRepository::<Pouf1>::new();
 
             // First, write some metadata to the repo.
-            let expires1 = Utc.ymd(2038, 1, 1).and_hms(0, 0, 0);
+            let expires1 = Utc.with_ymd_and_hms(2038, 1, 1, 0, 0, 0).unwrap();
             let metadata1 = RepoBuilder::create(&mut remote)
                 .trusted_root_keys(&[&KEYS[0]])
                 .trusted_targets_keys(&[&KEYS[1]])
@@ -2353,31 +2434,31 @@ mod tests {
 
             let mut expected_metadata: BTreeMap<_, _> = vec![
                 (
-                    (MetadataPath::root(), MetadataVersion::Number(1)),
+                    (MetadataPath::root(), Some(MetadataVersion::ONE)),
                     metadata1.root().unwrap().as_bytes(),
                 ),
                 (
-                    (MetadataPath::root(), MetadataVersion::None),
+                    (MetadataPath::root(), None),
                     metadata1.root().unwrap().as_bytes(),
                 ),
                 (
-                    (MetadataPath::targets(), MetadataVersion::Number(1)),
+                    (MetadataPath::targets(), Some(MetadataVersion::ONE)),
                     metadata1.targets().unwrap().as_bytes(),
                 ),
                 (
-                    (MetadataPath::targets(), MetadataVersion::None),
+                    (MetadataPath::targets(), None),
                     metadata1.targets().unwrap().as_bytes(),
                 ),
                 (
-                    (MetadataPath::snapshot(), MetadataVersion::Number(1)),
+                    (MetadataPath::snapshot(), Some(MetadataVersion::ONE)),
                     metadata1.snapshot().unwrap().as_bytes(),
                 ),
                 (
-                    (MetadataPath::snapshot(), MetadataVersion::None),
+                    (MetadataPath::snapshot(), None),
                     metadata1.snapshot().unwrap().as_bytes(),
                 ),
                 (
-                    (MetadataPath::timestamp(), MetadataVersion::None),
+                    (MetadataPath::timestamp(), None),
                     metadata1.timestamp().unwrap().as_bytes(),
                 ),
             ]
@@ -2389,7 +2470,7 @@ mod tests {
             let mut db = Database::from_trusted_metadata(&metadata1).unwrap();
 
             // Next, write another batch, but only have the timestamp, snapshot, and targets keys.
-            let expires2 = Utc.ymd(2038, 1, 2).and_hms(0, 0, 0);
+            let expires2 = Utc.with_ymd_and_hms(2038, 1, 2, 0, 0, 0).unwrap();
             let metadata2 = RepoBuilder::from_database(&mut remote, &db)
                 .trusted_targets_keys(&[&KEYS[1]])
                 .trusted_snapshot_keys(&[&KEYS[2]])
@@ -2412,36 +2493,33 @@ mod tests {
             assert!(metadata2.snapshot().is_some());
             assert!(metadata2.timestamp().is_some());
 
-            expected_metadata.extend(
-                vec![
-                    (
-                        (MetadataPath::targets(), MetadataVersion::Number(2)),
-                        metadata2.targets().unwrap().as_bytes(),
-                    ),
-                    (
-                        (MetadataPath::targets(), MetadataVersion::None),
-                        metadata2.targets().unwrap().as_bytes(),
-                    ),
-                    (
-                        (MetadataPath::snapshot(), MetadataVersion::Number(2)),
-                        metadata2.snapshot().unwrap().as_bytes(),
-                    ),
-                    (
-                        (MetadataPath::snapshot(), MetadataVersion::None),
-                        metadata2.snapshot().unwrap().as_bytes(),
-                    ),
-                    (
-                        (MetadataPath::timestamp(), MetadataVersion::None),
-                        metadata2.timestamp().unwrap().as_bytes(),
-                    ),
-                ]
-                .into_iter(),
-            );
+            expected_metadata.extend(vec![
+                (
+                    (MetadataPath::targets(), Some(TWO.into())),
+                    metadata2.targets().unwrap().as_bytes(),
+                ),
+                (
+                    (MetadataPath::targets(), None),
+                    metadata2.targets().unwrap().as_bytes(),
+                ),
+                (
+                    (MetadataPath::snapshot(), Some(TWO.into())),
+                    metadata2.snapshot().unwrap().as_bytes(),
+                ),
+                (
+                    (MetadataPath::snapshot(), None),
+                    metadata2.snapshot().unwrap().as_bytes(),
+                ),
+                (
+                    (MetadataPath::timestamp(), None),
+                    metadata2.timestamp().unwrap().as_bytes(),
+                ),
+            ]);
 
             assert_repo(&remote, &expected_metadata);
 
             // Now, only have the timestamp and snapshot keys online.
-            let expires3 = Utc.ymd(2038, 1, 3).and_hms(0, 0, 0);
+            let expires3 = Utc.with_ymd_and_hms(2038, 1, 3, 0, 0, 0).unwrap();
             let metadata3 = RepoBuilder::from_database(&mut remote, &db)
                 .trusted_snapshot_keys(&[&KEYS[2]])
                 .trusted_timestamp_keys(&[&KEYS[3]])
@@ -2463,28 +2541,25 @@ mod tests {
             assert!(metadata3.snapshot().is_some());
             assert!(metadata3.timestamp().is_some());
 
-            expected_metadata.extend(
-                vec![
-                    (
-                        (MetadataPath::snapshot(), MetadataVersion::Number(3)),
-                        metadata3.snapshot().unwrap().as_bytes(),
-                    ),
-                    (
-                        (MetadataPath::snapshot(), MetadataVersion::None),
-                        metadata3.snapshot().unwrap().as_bytes(),
-                    ),
-                    (
-                        (MetadataPath::timestamp(), MetadataVersion::None),
-                        metadata3.timestamp().unwrap().as_bytes(),
-                    ),
-                ]
-                .into_iter(),
-            );
+            expected_metadata.extend(vec![
+                (
+                    (MetadataPath::snapshot(), Some(THREE.into())),
+                    metadata3.snapshot().unwrap().as_bytes(),
+                ),
+                (
+                    (MetadataPath::snapshot(), None),
+                    metadata3.snapshot().unwrap().as_bytes(),
+                ),
+                (
+                    (MetadataPath::timestamp(), None),
+                    metadata3.timestamp().unwrap().as_bytes(),
+                ),
+            ]);
 
             assert_repo(&remote, &expected_metadata);
 
             // Finally, only have the timestamp keys online.
-            let expires4 = Utc.ymd(2038, 1, 4).and_hms(0, 0, 0);
+            let expires4 = Utc.with_ymd_and_hms(2038, 1, 4, 0, 0, 0).unwrap();
             let metadata4 = RepoBuilder::from_database(&mut remote, &db)
                 .trusted_timestamp_keys(&[&KEYS[3]])
                 .skip_root()
@@ -2504,13 +2579,10 @@ mod tests {
             assert!(metadata4.snapshot().is_none());
             assert!(metadata4.timestamp().is_some());
 
-            expected_metadata.extend(
-                vec![(
-                    (MetadataPath::timestamp(), MetadataVersion::None),
-                    metadata4.timestamp().unwrap().as_bytes(),
-                )]
-                .into_iter(),
-            );
+            expected_metadata.extend(vec![(
+                (MetadataPath::timestamp(), None),
+                metadata4.timestamp().unwrap().as_bytes(),
+            )]);
 
             assert_repo(&remote, &expected_metadata);
         })
@@ -2519,9 +2591,9 @@ mod tests {
     #[test]
     fn test_builder_inherits_from_trusted_targets() {
         block_on(async move {
-            let mut repo = EphemeralRepository::<Json>::new();
+            let mut repo = EphemeralRepository::<Pouf1>::new();
 
-            let expires = Utc.ymd(2038, 1, 4).and_hms(0, 0, 0);
+            let expires = Utc.with_ymd_and_hms(2038, 1, 4, 0, 0, 0).unwrap();
             let hash_algs = &[HashAlgorithm::Sha256, HashAlgorithm::Sha512];
             let delegation_key = &KEYS[0];
             let delegation_path = MetadataPath::new("delegations").unwrap();
@@ -2545,7 +2617,7 @@ mod tests {
                     &[HashAlgorithm::Sha256],
                 )
                 .unwrap()
-                .signed::<Json>(delegation_key)
+                .signed::<Pouf1>(delegation_key)
                 .unwrap();
             let raw_delegated_targets = delegated_targets1.to_raw().unwrap();
 
@@ -2569,7 +2641,7 @@ mod tests {
                         delegation_path.clone(),
                         MetadataDescription::from_slice(
                             raw_delegated_targets.as_bytes(),
-                            1,
+                            MetadataVersion::ONE,
                             &[HashAlgorithm::Sha256],
                         )
                         .unwrap(),
@@ -2603,7 +2675,7 @@ mod tests {
                     &[HashAlgorithm::Sha256],
                 )
                 .unwrap()
-                .signed::<Json>(delegation_key)
+                .signed::<Pouf1>(delegation_key)
                 .unwrap();
             let raw_delegated_targets = delegated_targets2.to_raw().unwrap();
 
@@ -2626,7 +2698,7 @@ mod tests {
                         delegation_path.clone(),
                         MetadataDescription::from_slice(
                             raw_delegated_targets.as_bytes(),
-                            1,
+                            MetadataVersion::ONE,
                             &[HashAlgorithm::Sha256],
                         )
                         .unwrap(),
@@ -2642,7 +2714,7 @@ mod tests {
             assert_eq!(
                 &**database.trusted_targets().unwrap(),
                 &TargetsMetadataBuilder::new()
-                    .version(2)
+                    .version(TWO)
                     .expires(expires)
                     .insert_target_from_slice(target_path1.clone(), target_file1, hash_algs)
                     .unwrap()
@@ -2665,7 +2737,7 @@ mod tests {
     #[test]
     fn test_builder_rotating_keys_refreshes_metadata() {
         block_on(async move {
-            let mut repo = EphemeralRepository::<Json>::new();
+            let mut repo = EphemeralRepository::<Pouf1>::new();
 
             let metadata1 = RepoBuilder::create(&mut repo)
                 .trusted_root_keys(&[&KEYS[0]])
@@ -2700,10 +2772,10 @@ mod tests {
 
             db.update_metadata(&metadata2).unwrap();
 
-            assert_eq!(db.trusted_root().version(), 2);
-            assert_eq!(db.trusted_targets().unwrap().version(), 2);
-            assert_eq!(db.trusted_snapshot().unwrap().version(), 2);
-            assert_eq!(db.trusted_timestamp().unwrap().version(), 2);
+            assert_eq!(db.trusted_root().version(), TWO.into());
+            assert_eq!(db.trusted_targets().unwrap().version(), TWO.into());
+            assert_eq!(db.trusted_snapshot().unwrap().version(), TWO.into());
+            assert_eq!(db.trusted_timestamp().unwrap().version(), TWO.into());
 
             // Note that rotating the timestamp keys purges all the metadata, so add it back in.
 
@@ -2724,10 +2796,10 @@ mod tests {
 
             db.update_metadata(&metadata3).unwrap();
 
-            assert_eq!(db.trusted_root().version(), 3);
-            assert_eq!(db.trusted_targets().unwrap().version(), 3);
-            assert_eq!(db.trusted_snapshot().unwrap().version(), 3);
-            assert_eq!(db.trusted_timestamp().unwrap().version(), 3);
+            assert_eq!(db.trusted_root().version(), THREE.into());
+            assert_eq!(db.trusted_targets().unwrap().version(), THREE.into());
+            assert_eq!(db.trusted_snapshot().unwrap().version(), THREE.into());
+            assert_eq!(db.trusted_timestamp().unwrap().version(), THREE.into());
 
             // Rotating the targets key should make a new targets, snapshot, and timestamp.
             let metadata4 = RepoBuilder::from_database(&mut repo, &db)
@@ -2746,10 +2818,10 @@ mod tests {
 
             db.update_metadata(&metadata4).unwrap();
 
-            assert_eq!(db.trusted_root().version(), 4);
-            assert_eq!(db.trusted_targets().unwrap().version(), 4);
-            assert_eq!(db.trusted_snapshot().unwrap().version(), 4);
-            assert_eq!(db.trusted_timestamp().unwrap().version(), 4);
+            assert_eq!(db.trusted_root().version(), FOUR.into());
+            assert_eq!(db.trusted_targets().unwrap().version(), FOUR.into());
+            assert_eq!(db.trusted_snapshot().unwrap().version(), FOUR.into());
+            assert_eq!(db.trusted_timestamp().unwrap().version(), FOUR.into());
 
             // Rotating the root key should make a new targets, snapshot, and timestamp.
             let metadata5 = RepoBuilder::from_database(&mut repo, &db)
@@ -2769,23 +2841,23 @@ mod tests {
 
             db.update_metadata(&metadata5).unwrap();
 
-            assert_eq!(db.trusted_root().version(), 5);
-            assert_eq!(db.trusted_targets().unwrap().version(), 5);
-            assert_eq!(db.trusted_snapshot().unwrap().version(), 5);
-            assert_eq!(db.trusted_timestamp().unwrap().version(), 5);
+            assert_eq!(db.trusted_root().version(), FIVE.into());
+            assert_eq!(db.trusted_targets().unwrap().version(), FIVE.into());
+            assert_eq!(db.trusted_snapshot().unwrap().version(), FIVE.into());
+            assert_eq!(db.trusted_timestamp().unwrap().version(), FIVE.into());
         })
     }
 
     #[test]
     fn test_builder_expired_metadata_refreshes_metadata() {
         block_on(async move {
-            let mut repo = EphemeralRepository::<Json>::new();
+            let mut repo = EphemeralRepository::<Pouf1>::new();
 
-            let epoch = DateTime::from_utc(NaiveDateTime::from_timestamp(0, 0), Utc);
-            let root_expires = epoch + Duration::seconds(40);
-            let targets_expires = epoch + Duration::seconds(30);
-            let snapshot_expires = epoch + Duration::seconds(20);
-            let timestamp_expires = epoch + Duration::seconds(10);
+            let epoch = Utc.timestamp_opt(0, 0).unwrap();
+            let root_expires = Duration::seconds(40);
+            let targets_expires = Duration::seconds(30);
+            let snapshot_expires = Duration::seconds(20);
+            let timestamp_expires = Duration::seconds(10);
 
             let current_time = epoch;
             let metadata1 = RepoBuilder::create(&mut repo)
@@ -2794,14 +2866,10 @@ mod tests {
                 .trusted_targets_keys(&[&KEYS[0]])
                 .trusted_snapshot_keys(&[&KEYS[0]])
                 .trusted_timestamp_keys(&[&KEYS[0]])
-                .stage_root_with_builder(|builder| builder.expires(root_expires))
-                .unwrap()
-                .stage_targets_with_builder(|builder| builder.expires(targets_expires))
-                .unwrap()
-                .stage_snapshot_with_builder(|builder| builder.expires(snapshot_expires))
-                .unwrap()
-                .stage_timestamp_with_builder(|builder| builder.expires(timestamp_expires))
-                .unwrap()
+                .root_expiration_duration(root_expires)
+                .targets_expiration_duration(targets_expires)
+                .snapshot_expiration_duration(snapshot_expires)
+                .timestamp_expiration_duration(timestamp_expires)
                 .commit()
                 .await
                 .unwrap();
@@ -2810,7 +2878,7 @@ mod tests {
                 Database::from_trusted_metadata_with_start_time(&metadata1, &current_time).unwrap();
 
             // Advance time to past the timestamp expiration.
-            let current_time = timestamp_expires + Duration::seconds(1);
+            let current_time = epoch + timestamp_expires + Duration::seconds(1);
             let metadata2 = RepoBuilder::from_database(&mut repo, &db)
                 .current_time(current_time)
                 .trusted_root_keys(&[&KEYS[0]])
@@ -2829,13 +2897,19 @@ mod tests {
             db.update_metadata_with_start_time(&metadata2, &current_time)
                 .unwrap();
 
-            assert_eq!(db.trusted_root().version(), 1);
-            assert_eq!(db.trusted_targets().unwrap().version(), 1);
-            assert_eq!(db.trusted_snapshot().unwrap().version(), 1);
-            assert_eq!(db.trusted_timestamp().unwrap().version(), 2);
+            assert_eq!(db.trusted_root().version(), MetadataVersion::ONE);
+            assert_eq!(
+                db.trusted_targets().unwrap().version(),
+                MetadataVersion::ONE
+            );
+            assert_eq!(
+                db.trusted_snapshot().unwrap().version(),
+                MetadataVersion::ONE
+            );
+            assert_eq!(db.trusted_timestamp().unwrap().version(), TWO.into());
 
             // Advance time to past the snapshot expiration.
-            let current_time = snapshot_expires + Duration::seconds(1);
+            let current_time = epoch + snapshot_expires + Duration::seconds(1);
             let metadata3 = RepoBuilder::from_database(&mut repo, &db)
                 .current_time(current_time)
                 .trusted_root_keys(&[&KEYS[0]])
@@ -2854,13 +2928,16 @@ mod tests {
             db.update_metadata_with_start_time(&metadata3, &current_time)
                 .unwrap();
 
-            assert_eq!(db.trusted_root().version(), 1);
-            assert_eq!(db.trusted_targets().unwrap().version(), 1);
-            assert_eq!(db.trusted_snapshot().unwrap().version(), 2);
-            assert_eq!(db.trusted_timestamp().unwrap().version(), 3);
+            assert_eq!(db.trusted_root().version(), MetadataVersion::ONE);
+            assert_eq!(
+                db.trusted_targets().unwrap().version(),
+                MetadataVersion::ONE
+            );
+            assert_eq!(db.trusted_snapshot().unwrap().version(), TWO.into());
+            assert_eq!(db.trusted_timestamp().unwrap().version(), THREE.into());
 
             // Advance time to past the targets expiration.
-            let current_time = targets_expires + Duration::seconds(1);
+            let current_time = epoch + targets_expires + Duration::seconds(1);
             let metadata4 = RepoBuilder::from_database(&mut repo, &db)
                 .current_time(current_time)
                 .trusted_root_keys(&[&KEYS[0]])
@@ -2879,10 +2956,10 @@ mod tests {
             db.update_metadata_with_start_time(&metadata4, &current_time)
                 .unwrap();
 
-            assert_eq!(db.trusted_root().version(), 1);
-            assert_eq!(db.trusted_targets().unwrap().version(), 2);
-            assert_eq!(db.trusted_snapshot().unwrap().version(), 3);
-            assert_eq!(db.trusted_timestamp().unwrap().version(), 4);
+            assert_eq!(db.trusted_root().version(), MetadataVersion::ONE);
+            assert_eq!(db.trusted_targets().unwrap().version(), TWO.into());
+            assert_eq!(db.trusted_snapshot().unwrap().version(), THREE.into());
+            assert_eq!(db.trusted_timestamp().unwrap().version(), FOUR.into());
 
             // Advance time to past the root expiration.
             //
@@ -2890,7 +2967,7 @@ mod tests {
             // snapshot.
             //
             // [update-root]: https://theupdateframework.github.io/specification/v1.0.30/#update-root
-            let current_time = root_expires + Duration::seconds(1);
+            let current_time = epoch + root_expires + Duration::seconds(1);
             let metadata5 = RepoBuilder::from_database(&mut repo, &db)
                 .current_time(current_time)
                 .trusted_root_keys(&[&KEYS[0]])
@@ -2909,17 +2986,17 @@ mod tests {
             db.update_metadata_with_start_time(&metadata5, &current_time)
                 .unwrap();
 
-            assert_eq!(db.trusted_root().version(), 2);
-            assert_eq!(db.trusted_targets().unwrap().version(), 3);
-            assert_eq!(db.trusted_snapshot().unwrap().version(), 4);
-            assert_eq!(db.trusted_timestamp().unwrap().version(), 5);
+            assert_eq!(db.trusted_root().version(), TWO.into());
+            assert_eq!(db.trusted_targets().unwrap().version(), THREE.into());
+            assert_eq!(db.trusted_snapshot().unwrap().version(), FOUR.into());
+            assert_eq!(db.trusted_timestamp().unwrap().version(), FIVE.into());
         })
     }
 
     #[test]
     fn test_adding_target_refreshes_metadata() {
         block_on(async move {
-            let mut repo = EphemeralRepository::<Json>::new();
+            let mut repo = EphemeralRepository::<Pouf1>::new();
 
             let metadata1 = RepoBuilder::create(&mut repo)
                 .trusted_root_keys(&[&KEYS[0]])
@@ -2954,10 +3031,222 @@ mod tests {
 
             db.update_metadata(&metadata2).unwrap();
 
-            assert_eq!(db.trusted_root().version(), 1);
-            assert_eq!(db.trusted_targets().unwrap().version(), 2);
-            assert_eq!(db.trusted_snapshot().unwrap().version(), 2);
-            assert_eq!(db.trusted_timestamp().unwrap().version(), 2);
+            assert_eq!(db.trusted_root().version(), MetadataVersion::ONE);
+            assert_eq!(db.trusted_targets().unwrap().version(), TWO.into());
+            assert_eq!(db.trusted_snapshot().unwrap().version(), TWO.into());
+            assert_eq!(db.trusted_timestamp().unwrap().version(), TWO.into());
+        })
+    }
+
+    #[test]
+    fn test_time_versioning() {
+        block_on(async move {
+            let mut repo = EphemeralRepository::<Pouf1>::new();
+
+            let current_time = Utc.timestamp_opt(5, 0).unwrap();
+            let metadata = RepoBuilder::create(&mut repo)
+                .current_time(current_time)
+                .time_versioning(true)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .trusted_snapshot_keys(&[&KEYS[0]])
+                .trusted_timestamp_keys(&[&KEYS[0]])
+                .commit()
+                .await
+                .unwrap();
+
+            let mut db =
+                Database::from_trusted_metadata_with_start_time(&metadata, &current_time).unwrap();
+
+            // The initial version should be the current time.
+            assert_eq!(db.trusted_root().version(), MetadataVersion::ONE);
+            assert_eq!(db.trusted_targets().map(|m| m.version().get()), Some(5));
+            assert_eq!(db.trusted_snapshot().map(|m| m.version().get()), Some(5));
+            assert_eq!(db.trusted_timestamp().map(|m| m.version().get()), Some(5));
+
+            // Generating metadata for the same timestamp should advance it by 1.
+            let metadata = RepoBuilder::from_database(&mut repo, &db)
+                .current_time(current_time)
+                .time_versioning(true)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .trusted_snapshot_keys(&[&KEYS[0]])
+                .trusted_timestamp_keys(&[&KEYS[0]])
+                .stage_root()
+                .unwrap()
+                .stage_targets()
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+
+            db.update_metadata_with_start_time(&metadata, &current_time)
+                .unwrap();
+
+            assert_eq!(db.trusted_root().version(), TWO.into());
+            assert_eq!(db.trusted_targets().map(|m| m.version().get()), Some(6));
+            assert_eq!(db.trusted_snapshot().map(|m| m.version().get()), Some(6));
+            assert_eq!(db.trusted_timestamp().map(|m| m.version().get()), Some(6));
+
+            // Generating metadata for a new timestamp should advance the versions to that amount.
+            let current_time = Utc.timestamp_opt(10, 0).unwrap();
+            let metadata = RepoBuilder::from_database(&mut repo, &db)
+                .current_time(current_time)
+                .time_versioning(true)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .trusted_snapshot_keys(&[&KEYS[0]])
+                .trusted_timestamp_keys(&[&KEYS[0]])
+                .stage_root()
+                .unwrap()
+                .stage_targets()
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+
+            db.update_metadata_with_start_time(&metadata, &current_time)
+                .unwrap();
+
+            assert_eq!(db.trusted_root().version(), THREE.into());
+            assert_eq!(db.trusted_targets().map(|m| m.version().get()), Some(10));
+            assert_eq!(db.trusted_snapshot().map(|m| m.version().get()), Some(10));
+            assert_eq!(db.trusted_timestamp().map(|m| m.version().get()), Some(10));
+        })
+    }
+
+    #[test]
+    fn test_time_versioning_falls_back_to_monotonic() {
+        block_on(async move {
+            let mut repo = EphemeralRepository::<Pouf1>::new();
+
+            // zero timestamp should initialize to 1.
+            let current_time = Utc.timestamp_opt(0, 0).unwrap();
+            let metadata = RepoBuilder::create(&mut repo)
+                .current_time(current_time)
+                .time_versioning(true)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .trusted_snapshot_keys(&[&KEYS[0]])
+                .trusted_timestamp_keys(&[&KEYS[0]])
+                .commit()
+                .await
+                .unwrap();
+
+            let mut db =
+                Database::from_trusted_metadata_with_start_time(&metadata, &current_time).unwrap();
+
+            assert_eq!(db.trusted_root().version(), MetadataVersion::ONE);
+            assert_eq!(
+                db.trusted_targets().map(|m| m.version()),
+                Some(MetadataVersion::ONE)
+            );
+            assert_eq!(
+                db.trusted_snapshot().map(|m| m.version()),
+                Some(MetadataVersion::ONE)
+            );
+            assert_eq!(
+                db.trusted_timestamp().map(|m| m.version()),
+                Some(MetadataVersion::ONE)
+            );
+
+            // A sub-second timestamp should advance the version by 1.
+            let current_time = Utc.timestamp_opt(0, 3).unwrap();
+            let metadata = RepoBuilder::from_database(&mut repo, &db)
+                .current_time(current_time)
+                .time_versioning(true)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .trusted_snapshot_keys(&[&KEYS[0]])
+                .trusted_timestamp_keys(&[&KEYS[0]])
+                .stage_root()
+                .unwrap()
+                .stage_targets()
+                .unwrap()
+                .commit()
+                .await
+                .unwrap();
+
+            db.update_metadata_with_start_time(&metadata, &current_time)
+                .unwrap();
+
+            assert_eq!(db.trusted_root().version(), TWO.into());
+            assert_eq!(db.trusted_targets().map(|m| m.version()), Some(TWO.into()));
+            assert_eq!(db.trusted_snapshot().map(|m| m.version()), Some(TWO.into()));
+            assert_eq!(
+                db.trusted_timestamp().map(|m| m.version()),
+                Some(TWO.into())
+            );
+        })
+    }
+
+    #[test]
+    fn test_builder_errs_if_no_keys() {
+        block_on(async move {
+            let repo = EphemeralRepository::<Pouf1>::new();
+
+            let metadata = RepoBuilder::create(&repo)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .trusted_snapshot_keys(&[&KEYS[0]])
+                .trusted_timestamp_keys(&[&KEYS[0]])
+                .commit()
+                .await
+                .unwrap();
+
+            let db = Database::from_trusted_metadata(&metadata).unwrap();
+
+            match RepoBuilder::from_database(&repo, &db).stage_root() {
+                Err(Error::MetadataRoleDoesNotHaveEnoughKeyIds {
+                    role,
+                    key_ids: 0,
+                    threshold: MetadataThreshold::ONE,
+                }) if role == MetadataPath::root() => {}
+                Err(err) => panic!("unexpected error: {}", err),
+                Ok(_) => panic!("unexpected success"),
+            }
+
+            match RepoBuilder::from_database(&repo, &db)
+                .trusted_root_keys(&[&KEYS[0]])
+                .stage_root_if_necessary()
+                .unwrap()
+                .stage_targets()
+            {
+                Err(Error::MissingPrivateKey { role }) if role == MetadataPath::targets() => {}
+                Err(err) => panic!("unexpected error: {}", err),
+                Ok(_) => panic!("unexpected success"),
+            }
+
+            match RepoBuilder::from_database(&repo, &db)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .stage_root_if_necessary()
+                .unwrap()
+                .stage_targets_if_necessary()
+                .unwrap()
+                .stage_snapshot()
+            {
+                Err(Error::MissingPrivateKey { role }) if role == MetadataPath::snapshot() => {}
+                Err(err) => panic!("unexpected error: {}", err),
+                Ok(_) => panic!("unexpected success"),
+            }
+
+            match RepoBuilder::from_database(&repo, &db)
+                .trusted_root_keys(&[&KEYS[0]])
+                .trusted_targets_keys(&[&KEYS[0]])
+                .trusted_snapshot_keys(&[&KEYS[0]])
+                .stage_root_if_necessary()
+                .unwrap()
+                .stage_targets_if_necessary()
+                .unwrap()
+                .stage_snapshot_if_necessary()
+                .unwrap()
+                .stage_timestamp()
+            {
+                Err(Error::MissingPrivateKey { role }) if role == MetadataPath::timestamp() => {}
+                Err(err) => panic!("unexpected error: {}", err),
+                Ok(_) => panic!("unexpected success"),
+            }
         })
     }
 }

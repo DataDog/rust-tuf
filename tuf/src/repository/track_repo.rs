@@ -1,35 +1,39 @@
 use {
     crate::{
-        interchange::DataInterchange,
-        metadata::{Metadata, MetadataPath, MetadataVersion, RawSignedMetadata, TargetPath},
-        repository::{RepositoryProvider, RepositoryStorage},
         Result,
+        metadata::{Metadata, MetadataPath, MetadataVersion, RawSignedMetadata, TargetPath},
+        pouf::Pouf,
+        repository::{RepositoryProvider, RepositoryStorage},
     },
     futures_io::AsyncRead,
     futures_util::{
         future::{BoxFuture, FutureExt},
         io::{AsyncReadExt, Cursor},
     },
-    std::sync::{Arc, Mutex},
+    std::sync::Mutex,
 };
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Track {
     Store {
         path: MetadataPath,
-        version: MetadataVersion,
+        version: Option<MetadataVersion>,
         metadata: String,
     },
     FetchFound {
         path: MetadataPath,
-        version: MetadataVersion,
+        version: Option<MetadataVersion>,
         metadata: String,
     },
-    FetchErr(MetadataPath, MetadataVersion),
+    FetchErr(MetadataPath, Option<MetadataVersion>),
 }
 
 impl Track {
-    pub(crate) fn store<T>(meta_path: &MetadataPath, version: MetadataVersion, metadata: T) -> Self
+    pub(crate) fn store<T>(
+        meta_path: &MetadataPath,
+        version: Option<MetadataVersion>,
+        metadata: T,
+    ) -> Self
     where
         T: Into<Vec<u8>>,
     {
@@ -41,19 +45,19 @@ impl Track {
     }
 
     pub(crate) fn store_meta<M, D>(
-        version: MetadataVersion,
+        version: Option<MetadataVersion>,
         metadata: &RawSignedMetadata<D, M>,
     ) -> Self
     where
         M: Metadata,
-        D: DataInterchange,
+        D: Pouf,
     {
         Self::store(&M::ROLE.into(), version, metadata.as_bytes())
     }
 
     pub(crate) fn fetch_found<T>(
         meta_path: &MetadataPath,
-        version: MetadataVersion,
+        version: Option<MetadataVersion>,
         metadata: T,
     ) -> Self
     where
@@ -67,12 +71,12 @@ impl Track {
     }
 
     pub(crate) fn fetch_meta_found<M, D>(
-        version: MetadataVersion,
+        version: Option<MetadataVersion>,
         metadata: &RawSignedMetadata<D, M>,
     ) -> Self
     where
         M: Metadata,
-        D: DataInterchange,
+        D: Pouf,
     {
         Track::fetch_found(&M::ROLE.into(), version, metadata.as_bytes())
     }
@@ -81,14 +85,14 @@ impl Track {
 /// Helper Repository wrapper that tracks all the metadata fetches and stores for testing purposes.
 pub(crate) struct TrackRepository<R> {
     repo: R,
-    tracks: Arc<Mutex<Vec<Track>>>,
+    tracks: Mutex<Vec<Track>>,
 }
 
 impl<R> TrackRepository<R> {
     pub(crate) fn new(repo: R) -> Self {
         Self {
             repo,
-            tracks: Arc::new(Mutex::new(vec![])),
+            tracks: Mutex::new(vec![]),
         }
     }
 
@@ -104,13 +108,13 @@ impl<R> TrackRepository<R> {
 impl<D, R> RepositoryStorage<D> for TrackRepository<R>
 where
     R: RepositoryStorage<D> + Sync + Send,
-    D: DataInterchange + Sync,
+    D: Pouf,
 {
     fn store_metadata<'a>(
-        &'a mut self,
+        &'a self,
         meta_path: &MetadataPath,
-        version: MetadataVersion,
-        metadata: &'a mut (dyn AsyncRead + Send + Unpin + 'a),
+        version: Option<MetadataVersion>,
+        metadata: &'a mut (dyn AsyncRead + Send + Unpin),
     ) -> BoxFuture<'a, Result<()>> {
         let meta_path = meta_path.clone();
         async move {
@@ -133,9 +137,9 @@ where
     }
 
     fn store_target<'a>(
-        &'a mut self,
+        &'a self,
         target_path: &TargetPath,
-        target: &'a mut (dyn AsyncRead + Send + Unpin + 'a),
+        target: &'a mut (dyn AsyncRead + Send + Unpin),
     ) -> BoxFuture<'a, Result<()>> {
         self.repo.store_target(target_path, target)
     }
@@ -143,13 +147,13 @@ where
 
 impl<D, R> RepositoryProvider<D> for TrackRepository<R>
 where
-    D: DataInterchange + Sync,
+    D: Pouf,
     R: RepositoryProvider<D> + Sync,
 {
     fn fetch_metadata<'a>(
         &'a self,
         meta_path: &MetadataPath,
-        version: MetadataVersion,
+        version: Option<MetadataVersion>,
     ) -> BoxFuture<'a, Result<Box<dyn AsyncRead + Send + Unpin + 'a>>> {
         let meta_path = meta_path.clone();
         async move {
