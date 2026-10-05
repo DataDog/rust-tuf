@@ -1109,7 +1109,7 @@ where
                         .get(delegation.name())
                         .unwrap()
                         .clone();
-                    let f: Pin<Box<dyn Future<Output = _>>> =
+                    let f: Pin<Box<dyn Future<Output = (bool, Result<TargetDescription>)>>> =
                         Box::pin(self.lookup_target_description(
                             start_time,
                             delegation.terminating(),
