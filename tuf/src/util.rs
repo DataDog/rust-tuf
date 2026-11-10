@@ -1,12 +1,12 @@
 use futures_io::AsyncRead;
 use futures_util::ready;
-use ring::digest;
 use std::io::{self, ErrorKind};
 use std::marker::Unpin;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use crate::backend::digest;
 use crate::crypto::{HashAlgorithm, HashValue};
 use crate::Result;
 
@@ -179,9 +179,9 @@ impl<R: AsyncRead + Unpin> AsyncRead for SafeReader<R> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use digest::SHA256;
     use futures_executor::block_on;
     use futures_util::io::AsyncReadExt;
-    use ring::digest::SHA256;
 
     #[test]
     fn valid_read() {

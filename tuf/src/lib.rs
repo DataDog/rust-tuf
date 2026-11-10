@@ -124,5 +124,15 @@ pub mod verify;
 mod format_hex;
 mod util;
 
+#[cfg(not(any(feature = "ring", feature = "aws-lc-rs", feature = "fips")))]
+compile_error!(
+    "tuf requires a crypto backend: enable the `ring` (default), `aws-lc-rs`, or `fips` feature"
+);
+
+#[cfg(any(feature = "aws-lc-rs", feature = "fips"))]
+pub(crate) use aws_lc_rs as backend;
+#[cfg(all(feature = "ring", not(any(feature = "aws-lc-rs", feature = "fips"))))]
+pub(crate) use ring as backend;
+
 pub use crate::database::*;
 pub use crate::error::*;
