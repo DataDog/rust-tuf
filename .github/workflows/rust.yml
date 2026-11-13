@@ -47,6 +47,47 @@ jobs:
           command: test
           args: "--manifest-path tuf/Cargo.toml --features unstable_rsa"
 
+  crypto-backends:
+    name: crypto backend (${{ matrix.backend }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [ring, aws-lc-rs, fips]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # aws-lc-fips-sys builds the AWS-LC FIPS module with CMake and Go.
+      - name: Install Go
+        if: matrix.backend == 'fips'
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Check dependency graph
+        run: |
+          backend=${{ matrix.backend }}
+          tree() { cargo tree -e normal --no-default-features --features "$backend" -i "$1" 2>/dev/null; }
+          if [ "$backend" != ring ] && [ -n "$(tree ring)" ]; then
+            echo "ring is in the dependency graph"; tree ring; exit 1
+          fi
+          if [ "$backend" = fips ] && [ -n "$(tree aws-lc-sys)" ]; then
+            echo "aws-lc-sys is in the dependency graph"; tree aws-lc-sys; exit 1
+          fi
+
+      - name: Run Tests
+        run: cargo test -p tuf --no-default-features --features ${{ matrix.backend }},hyper,hyper/tcp
+
+      - name: Run Tests with RSA
+        run: cargo test -p tuf --no-default-features --features ${{ matrix.backend }},hyper,hyper/tcp,unstable_rsa
+
+      - name: Run Interop Tests
+        run: cargo test -p interop-tests --no-default-features --features ${{ matrix.backend }}
+
   rustfmt:
     name: rustfmt
     runs-on: ubuntu-latest

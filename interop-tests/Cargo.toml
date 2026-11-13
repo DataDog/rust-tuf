@@ -17,8 +17,14 @@ futures-executor = "0.3.1"
 serde = "1"
 serde_derive = "1"
 serde_json = "1"
-tuf = { version = "0.3.0-beta10", path = "../tuf" }
+tuf = { version = "0.3.0-beta10", path = "../tuf", default-features = false }
 walkdir = "2.3.2"
+
+[features]
+default = ["ring"]
+ring = ["tuf/ring"]
+aws-lc-rs = ["tuf/aws-lc-rs"]
+fips = ["tuf/fips"]
 
 [dev-dependencies]
 assert_matches = "1.5.0"

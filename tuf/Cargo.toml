@@ -17,6 +17,7 @@ name = "tuf"
 path = "./src/lib.rs"
 
 [dependencies]
+aws-lc-rs = { version = "1.13", default-features = false, optional = true }
 chrono = { version = "0.4", features = [ "serde" ] }
 data-encoding = "2.0.0-rc.2"
 derp = "0.0.14"
@@ -27,7 +28,7 @@ hyper = { version = "0.14.15", default-features = false, features = [ "stream", 
 itoa = "0.4"
 log = "0.4"
 percent-encoding = "2.1"
-ring = { version = "0.17" }
+ring = { version = "0.17", optional = true }
 serde = "1"
 serde_derive = "1"
 serde_json = "1"
@@ -47,7 +48,18 @@ pretty_assertions = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [features]
-default = ["hyper", "hyper/tcp"]
+default = ["ring", "hyper", "hyper/tcp"]
+
+# Crypto backends. Exactly one is used: if both `ring` and `aws-lc-rs` (or
+# `fips`) are enabled, `aws-lc-rs` is used and `ring` is compiled but unused.
+# Building with neither is a compile error.
+ring = ["dep:ring"]
+aws-lc-rs = ["dep:aws-lc-rs", "aws-lc-rs?/aws-lc-sys"]
+# Uses `aws-lc-rs` backed by the AWS-LC FIPS module (`aws-lc-fips-sys`). This
+# deliberately does not enable the `aws-lc-rs` feature above, so the non-FIPS
+# `aws-lc-sys` crate stays out of the dependency graph. The `?` is required:
+# `aws-lc-rs/fips` would also enable this crate's `aws-lc-rs` feature.
+fips = ["dep:aws-lc-rs", "aws-lc-rs?/fips"]
 
 # FIXME(https://github.com/theupdateframework/rust-tuf/issues/329) - RSA key
 # support does not yet conform to the TUF spec, so it is disabled by default.
