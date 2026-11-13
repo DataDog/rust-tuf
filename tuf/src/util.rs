@@ -312,6 +312,78 @@ mod test {
         })
     }
 
+    /// Yields at most `chunk` bytes per read so the hasher sees many updates.
+    struct Chunked<'a> {
+        data: &'a [u8],
+        chunk: usize,
+    }
+
+    impl AsyncRead for Chunked<'_> {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let n = self.chunk.min(buf.len()).min(self.data.len());
+            buf[..n].copy_from_slice(&self.data[..n]);
+            self.data = &self.data[n..];
+            Poll::Ready(Ok(n))
+        }
+    }
+
+    fn hash_value(hex: &str) -> HashValue {
+        HashValue::new(data_encoding::HEXLOWER.decode(hex.as_bytes()).unwrap())
+    }
+
+    #[test]
+    fn known_sha256_and_sha512_digests_streamed() {
+        block_on(async {
+            let million_a = vec![b'a'; 1_000_000];
+            let cases: [(&[u8], &str, &str); 2] = [
+                (
+                    b"abc",
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                    "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+                     2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f",
+                ),
+                (
+                    &million_a,
+                    "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
+                    "e718483d0ce769644e2e42c7bc15b4638e1f98b13b2044285632a803afa973eb\
+                     de0ff244877ea60a4cb0432ce577c31beb009c5c2c49aa2e4eadb217ad8cc09b",
+                ),
+            ];
+
+            for (data, sha256, sha512) in cases {
+                let mut reader = SafeReader::new(
+                    Chunked { data, chunk: 7 },
+                    data.len() as u64,
+                    vec![
+                        (&HashAlgorithm::Sha256, hash_value(sha256)),
+                        (&HashAlgorithm::Sha512, hash_value(sha512)),
+                    ],
+                )
+                .unwrap();
+                let mut buf = Vec::new();
+                reader.read_to_end(&mut buf).await.unwrap();
+                assert_eq!(buf, data);
+
+                let mut wrong = hash_value(sha512).value().to_vec();
+                wrong[0] ^= 0x01;
+                let mut reader = SafeReader::new(
+                    Chunked { data, chunk: 7 },
+                    data.len() as u64,
+                    vec![
+                        (&HashAlgorithm::Sha256, hash_value(sha256)),
+                        (&HashAlgorithm::Sha512, HashValue::new(wrong)),
+                    ],
+                )
+                .unwrap();
+                assert!(reader.read_to_end(&mut Vec::new()).await.is_err());
+            }
+        })
+    }
+
     #[test]
     fn enforce_minimum_bitrate_is_identity_for_fast_transfers() {
         block_on(async {
