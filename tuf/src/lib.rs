@@ -129,8 +129,10 @@ compile_error!(
     "tuf requires a crypto backend: enable the `ring` (default), `aws-lc-rs`, or `fips` feature"
 );
 
-#[cfg(any(feature = "aws-lc-rs", feature = "fips"))]
+#[cfg(all(feature = "aws-lc-rs", not(feature = "fips")))]
 pub(crate) use aws_lc_rs as backend;
+#[cfg(feature = "fips")]
+pub(crate) use aws_lc_rs_fips as backend;
 #[cfg(all(feature = "ring", not(any(feature = "aws-lc-rs", feature = "fips"))))]
 pub(crate) use ring as backend;
 
