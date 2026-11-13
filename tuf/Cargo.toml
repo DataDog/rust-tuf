@@ -18,6 +18,12 @@ path = "./src/lib.rs"
 
 [dependencies]
 aws-lc-rs = { version = "1.13", default-features = false, optional = true }
+# The `fips` backend. aws-lc-rs 1.18 and later bind AWS-LC-FIPS 4.x, which is not yet FIPS
+# 140-3 certified; 1.17.x binds the certified AWS-LC-FIPS 3.x module (CMVP #5314, #5298).
+# A git source is a separate package from the registry `aws-lc-rs`, so this pin holds even
+# when other crates in the same lockfile require aws-lc-rs 1.18 or later. Move to the
+# registry once AWS-LC-FIPS 4.x is listed under "Validations" in AWS-LC's FIPS.md.
+aws-lc-rs-fips = { package = "aws-lc-rs", git = "https://github.com/aws/aws-lc-rs", tag = "v1.17.4", default-features = false, optional = true }
 chrono = { version = "0.4", features = [ "serde" ] }
 data-encoding = "2.0.0-rc.2"
 derp = "0.0.14"
@@ -50,16 +56,14 @@ serde_json = { version = "1", features = ["preserve_order"] }
 [features]
 default = ["ring", "hyper", "hyper/tcp"]
 
-# Crypto backends. Exactly one is used: if both `ring` and `aws-lc-rs` (or
-# `fips`) are enabled, `aws-lc-rs` is used and `ring` is compiled but unused.
-# Building with neither is a compile error.
+# Crypto backends. Exactly one is used, in order of precedence `fips`, `aws-lc-rs`,
+# `ring`; the others are compiled but unused. Building with none is a compile error.
 ring = ["dep:ring"]
 aws-lc-rs = ["dep:aws-lc-rs", "aws-lc-rs?/aws-lc-sys"]
-# Uses `aws-lc-rs` backed by the AWS-LC FIPS module (`aws-lc-fips-sys`). This
-# deliberately does not enable the `aws-lc-rs` feature above, so the non-FIPS
-# `aws-lc-sys` crate stays out of the dependency graph. The `?` is required:
-# `aws-lc-rs/fips` would also enable this crate's `aws-lc-rs` feature.
-fips = ["dep:aws-lc-rs", "aws-lc-rs?/fips"]
+# Uses the pinned `aws-lc-rs-fips` dependency backed by the AWS-LC FIPS module
+# (`aws-lc-fips-sys`). This does not enable the `aws-lc-rs` feature above, so the
+# non-FIPS `aws-lc-sys` crate stays out of the dependency graph.
+fips = ["dep:aws-lc-rs-fips", "aws-lc-rs-fips?/fips"]
 
 # FIXME(https://github.com/theupdateframework/rust-tuf/issues/329) - RSA key
 # support does not yet conform to the TUF spec, so it is disabled by default.

@@ -78,6 +78,10 @@ jobs:
           if [ "$backend" = fips ] && [ -n "$(tree aws-lc-sys)" ]; then
             echo "aws-lc-sys is in the dependency graph"; tree aws-lc-sys; exit 1
           fi
+          # aws-lc-fips-sys 0.14 and later bundle AWS-LC-FIPS 4.x, which is not yet certified.
+          if [ "$backend" = fips ] && ! tree aws-lc-fips-sys | head -n 1 | grep -q '^aws-lc-fips-sys v0\.13\.'; then
+            echo "fips must use aws-lc-fips-sys 0.13 (AWS-LC-FIPS 3.x)"; tree aws-lc-fips-sys; exit 1
+          fi
 
       - name: Run Tests
         run: cargo test -p tuf --no-default-features --features ${{ matrix.backend }},hyper,hyper/tcp
