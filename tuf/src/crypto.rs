@@ -47,6 +47,10 @@ use crate::error::{derp_error_to_error, Error, Result};
 use crate::interchange::cjson::shims;
 use crate::metadata::MetadataPath;
 
+pub mod provider;
+
+pub use provider::{CryptoProvider, DigestContext, Ed25519Signer};
+
 const HASH_ALG_PREFS: &[HashAlgorithm] = &[HashAlgorithm::Sha512, HashAlgorithm::Sha256];
 
 /// 1.2.840.113549.1.1.1 rsaEncryption(PKCS #1)
