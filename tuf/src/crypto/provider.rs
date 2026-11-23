@@ -195,6 +195,40 @@ pub fn compiled() -> Vec<&'static dyn CryptoProvider> {
     providers
 }
 
+static DEFAULT: std::sync::OnceLock<&'static dyn CryptoProvider> = std::sync::OnceLock::new();
+
+/// Make `provider` the one TUF uses in this process. Installing the provider that is already
+/// installed is a no-op; installing a different one is an error.
+pub fn install_default(provider: &'static dyn CryptoProvider) -> Result<()> {
+    let installed = *DEFAULT.get_or_init(|| provider);
+    if installed.name() == provider.name() {
+        Ok(())
+    } else {
+        Err(crate::error::Error::CryptoProviderAlreadyInstalled {
+            installed: installed.name(),
+            requested: provider.name(),
+        })
+    }
+}
+
+/// The provider TUF uses: the installed one, or the only compiled one. With several compiled and
+/// none installed, an error rather than a guess.
+pub fn get_default() -> Result<&'static dyn CryptoProvider> {
+    if let Some(provider) = DEFAULT.get() {
+        return Ok(*provider);
+    }
+    match compiled().as_slice() {
+        [only] => Ok(*DEFAULT.get_or_init(|| *only)),
+        several => Err(crate::error::Error::NoCryptoProvider(
+            several
+                .iter()
+                .map(|p| p.name())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

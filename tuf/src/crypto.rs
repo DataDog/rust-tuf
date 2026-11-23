@@ -49,7 +49,7 @@ use crate::metadata::MetadataPath;
 
 pub mod provider;
 
-pub use provider::{CryptoProvider, DigestContext, Ed25519Signer};
+pub use provider::{get_default, install_default, CryptoProvider, DigestContext, Ed25519Signer};
 
 const HASH_ALG_PREFS: &[HashAlgorithm] = &[HashAlgorithm::Sha512, HashAlgorithm::Sha256];
 
