@@ -56,8 +56,9 @@ serde_json = { version = "1", features = ["preserve_order"] }
 [features]
 default = ["ring", "hyper", "hyper/tcp"]
 
-# Crypto backends. Exactly one is used, in order of precedence `fips`, `aws-lc-rs`,
-# `ring`; the others are compiled but unused. Building with none is a compile error.
+# Crypto backends. Each one compiles a provider (`tuf::crypto::provider::*`), and several may be
+# enabled together. With one, it is used automatically; with several, the application must call
+# `tuf::crypto::install_default` before using tuf. Building with none is a compile error.
 ring = ["dep:ring"]
 aws-lc-rs = ["dep:aws-lc-rs", "aws-lc-rs?/aws-lc-sys"]
 # Uses the pinned `aws-lc-rs-fips` dependency backed by the AWS-LC FIPS module
