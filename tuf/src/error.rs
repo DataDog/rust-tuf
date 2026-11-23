@@ -176,6 +176,22 @@ pub enum Error {
         /// That child metadata that was not delegated to by the parent.
         child_role: MetadataPath,
     },
+
+    /// Several crypto backends are compiled in and the application installed none.
+    #[error(
+        "several crypto backends are compiled in ({0}); call `tuf::crypto::install_default` \
+         before using tuf"
+    )]
+    NoCryptoProvider(String),
+
+    /// `install_default` was called with a provider other than the installed one.
+    #[error("crypto provider `{installed}` is already installed; cannot install `{requested}`")]
+    CryptoProviderAlreadyInstalled {
+        /// The installed provider.
+        installed: &'static str,
+        /// The provider that was rejected.
+        requested: &'static str,
+    },
 }
 
 pub(crate) fn derp_error_to_error(err: derp::Error) -> Error {

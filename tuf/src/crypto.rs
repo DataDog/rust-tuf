@@ -20,20 +20,11 @@ use {
     untrusted::Input,
 };
 
-use crate::backend::{
-    digest::{self, SHA256, SHA512},
-    rand::SystemRandom,
-    signature::{
-        Ed25519KeyPair, KeyPair, UnparsedPublicKey, VerificationAlgorithm, ECDSA_P256_SHA256_ASN1,
-        ED25519,
-    },
-};
-
 #[cfg(feature = "unstable_rsa")]
 use {
-    crate::backend::signature::{
-        RsaKeyPair, RSA_PSS_2048_8192_SHA256, RSA_PSS_2048_8192_SHA512, RSA_PSS_SHA256,
-        RSA_PSS_SHA512,
+    crate::rsa_backend::{
+        rand::SystemRandom,
+        signature::{RsaKeyPair, RSA_PSS_SHA256, RSA_PSS_SHA512},
     },
     data_encoding::BASE64URL,
     std::{
@@ -46,6 +37,10 @@ use {
 use crate::error::{derp_error_to_error, Error, Result};
 use crate::interchange::cjson::shims;
 use crate::metadata::MetadataPath;
+
+pub mod provider;
+
+pub use provider::{get_default, install_default, CryptoProvider, DigestContext, Ed25519Signer};
 
 const HASH_ALG_PREFS: &[HashAlgorithm] = &[HashAlgorithm::Sha512, HashAlgorithm::Sha256];
 
@@ -131,7 +126,7 @@ pub fn retain_supported_hashes<'a>(
 pub(crate) fn calculate_hash(data: &[u8], hash_alg: &HashAlgorithm) -> HashValue {
     let mut context = hash_alg.digest_context().unwrap();
     context.update(data);
-    HashValue::new(context.finish().as_ref().to_vec())
+    HashValue::new(context.finish())
 }
 
 /// Calculate the size and hash digest from a given `AsyncRead`.
@@ -150,10 +145,7 @@ pub fn calculate_hashes_from_slice(
         let mut context = alg.digest_context()?;
         context.update(buf);
 
-        hashes.insert(
-            alg.clone(),
-            HashValue::new(context.finish().as_ref().to_vec()),
-        );
+        hashes.insert(alg.clone(), HashValue::new(context.finish()));
     }
 
     Ok(hashes)
@@ -199,7 +191,7 @@ where
 
     let hashes = hashes
         .drain()
-        .map(|(k, v)| (k.clone(), HashValue::new(v.finish().as_ref().to_vec())))
+        .map(|(k, v)| (k.clone(), HashValue::new(v.finish())))
         .collect();
     Ok((size, hashes))
 }
@@ -263,10 +255,10 @@ fn calculate_key_id(
         public_key,
     )?;
     let public_key = Json::canonicalize(&Json::serialize(&public_key)?)?;
-    let mut context = digest::Context::new(&SHA256);
+    let mut context = HashAlgorithm::Sha256.digest_context()?;
     context.update(&public_key);
 
-    let key_id = HEXLOWER.encode(context.finish().as_ref());
+    let key_id = HEXLOWER.encode(&context.finish());
 
     Ok(KeyId(key_id))
 }
@@ -508,16 +500,14 @@ pub trait PrivateKey {
 
 /// A structure containing information about an Ed25519 private key.
 pub struct Ed25519PrivateKey {
-    private: Ed25519KeyPair,
+    private: Box<dyn Ed25519Signer>,
     public: PublicKey,
 }
 
 impl Ed25519PrivateKey {
     /// Generate Ed25519 key bytes in pkcs8 format.
     pub fn pkcs8() -> Result<Vec<u8>> {
-        Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
-            .map(|bytes| bytes.as_ref().to_vec())
-            .map_err(|_| Error::Opaque("Failed to generate Ed25519 key".into()))
+        get_default()?.ed25519_generate_pkcs8()
     }
 
     /// Create a new `PrivateKey` from an ed25519 keypair. The keypair is a 64 byte slice, where the
@@ -542,8 +532,8 @@ impl Ed25519PrivateKey {
         let private_key_bytes = &key[..ED25519_PRIVATE_KEY_LENGTH];
         let public_key_bytes = &key[ED25519_PUBLIC_KEY_LENGTH..];
 
-        let private = Ed25519KeyPair::from_seed_and_public_key(private_key_bytes, public_key_bytes)
-            .map_err(|err| Error::Encoding(err.to_string()))?;
+        let private =
+            get_default()?.ed25519_from_seed_and_public_key(private_key_bytes, public_key_bytes)?;
         Self::from_keypair_with_keyid_hash_algorithms(private, keyid_hash_algorithms)
     }
 
@@ -583,14 +573,14 @@ impl Ed25519PrivateKey {
     }
 
     fn from_keypair_with_keyid_hash_algorithms(
-        private: Ed25519KeyPair,
+        private: Box<dyn Ed25519Signer>,
         keyid_hash_algorithms: Option<Vec<String>>,
     ) -> Result<Self> {
         let public = PublicKey::new(
             KeyType::Ed25519,
             SignatureScheme::Ed25519,
             keyid_hash_algorithms,
-            private.public_key().as_ref().to_vec(),
+            private.public_key().to_vec(),
         )?;
 
         Ok(Ed25519PrivateKey { private, public })
@@ -612,10 +602,11 @@ const ED25519_LEGACY_PKCS8_MIDDLE: &[u8] = &[0xa1, 0x23, 0x03, 0x21, 0x00];
 /// STRING`. Backends disagree on that encoding: *ring* 0.17 accepts it and checks the public key,
 /// *aws-lc-rs* rejects it, and the AWS-LC FIPS module accepts it but ignores the public key. It is
 /// therefore always loaded from its seed and public key, which are checked for consistency.
-fn ed25519_keypair_from_pkcs8(der_key: &[u8]) -> Result<Ed25519KeyPair> {
+fn ed25519_keypair_from_pkcs8(der_key: &[u8]) -> Result<Box<dyn Ed25519Signer>> {
+    let provider = get_default()?;
     let key = match legacy_ed25519_pkcs8_components(der_key) {
-        Some((seed, public_key)) => Ed25519KeyPair::from_seed_and_public_key(seed, public_key),
-        None => Ed25519KeyPair::from_pkcs8(der_key),
+        Some((seed, public_key)) => provider.ed25519_from_seed_and_public_key(seed, public_key),
+        None => provider.ed25519_from_pkcs8(der_key),
     };
     key.map_err(|_| Error::Encoding("Could not parse key as PKCS#8v2".into()))
 }
@@ -639,7 +630,7 @@ impl PrivateKey for Ed25519PrivateKey {
     fn sign(&self, msg: &[u8]) -> Result<Signature> {
         debug_assert!(self.public.scheme == SignatureScheme::Ed25519);
 
-        let value = SignatureValue(self.private.sign(msg).as_ref().into());
+        let value = SignatureValue(self.private.sign(msg));
         Ok(Signature {
             key_id: self.public.key_id().clone(),
             value,
@@ -894,18 +885,6 @@ impl PublicKey {
     pub fn verify(&self, role: &MetadataPath, msg: &[u8], sig: &Signature) -> Result<()> {
         // ECDSA: `value` holds the PEM SPKI; the backend wants the raw uncompressed EC point.
         let ec_point;
-        let alg: &'static dyn VerificationAlgorithm = match self.scheme {
-            SignatureScheme::Ed25519 => &ED25519,
-            #[cfg(feature = "unstable_rsa")]
-            SignatureScheme::RsaSsaPssSha256 => &RSA_PSS_2048_8192_SHA256,
-            #[cfg(feature = "unstable_rsa")]
-            SignatureScheme::RsaSsaPssSha512 => &RSA_PSS_2048_8192_SHA512,
-            SignatureScheme::EcdsaSha2Nistp256 => &ECDSA_P256_SHA256_ASN1,
-            SignatureScheme::Unknown(ref s) => {
-                return Err(Error::UnknownSignatureScheme(s.to_string()));
-            }
-        };
-
         let key_bytes: &[u8] = match self.scheme {
             SignatureScheme::EcdsaSha2Nistp256 => {
                 ec_point = ec_point_from_pem_spki(&self.value.0)
@@ -915,9 +894,12 @@ impl PublicKey {
             _ => &self.value.0,
         };
 
-        let key = UnparsedPublicKey::new(alg, key_bytes);
-        key.verify(msg, &sig.value.0)
-            .map_err(|_| Error::BadSignature(role.clone()))
+        let verified = get_default()?.verify(&self.scheme, key_bytes, msg, &sig.value.0)?;
+        if verified {
+            Ok(())
+        } else {
+            Err(Error::BadSignature(role.clone()))
+        }
     }
 }
 
@@ -1161,17 +1143,9 @@ pub enum HashAlgorithm {
 }
 
 impl HashAlgorithm {
-    /// Create a new `digest::Context` suitable for computing the hash of some data using this hash
-    /// algorithm.
-    pub(crate) fn digest_context(&self) -> Result<digest::Context> {
-        match self {
-            HashAlgorithm::Sha256 => Ok(digest::Context::new(&SHA256)),
-            HashAlgorithm::Sha512 => Ok(digest::Context::new(&SHA512)),
-            HashAlgorithm::Unknown(ref s) => Err(Error::IllegalArgument(format!(
-                "Unknown hash algorithm: {}",
-                s
-            ))),
-        }
+    /// Start hashing with this algorithm on the default crypto provider.
+    pub(crate) fn digest_context(&self) -> Result<Box<dyn DigestContext>> {
+        get_default()?.digest(self)
     }
 }
 
@@ -1431,8 +1405,8 @@ mod test {
 
         // Make sure we match what the crypto backend expects.
         let backend_key = ed25519_keypair_from_pkcs8(ed25519::PK8_1).unwrap();
-        assert_eq!(key.public().as_bytes(), backend_key.public_key().as_ref());
-        assert_eq!(sig.value().as_bytes(), backend_key.sign(msg).as_ref());
+        assert_eq!(key.public().as_bytes(), backend_key.public_key());
+        assert_eq!(sig.value().as_bytes(), &backend_key.sign(msg)[..]);
 
         // Make sure verification fails with the wrong key.
         let bad_pub_key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2)
@@ -1460,8 +1434,8 @@ mod test {
 
         // Make sure we match what the crypto backend expects.
         let backend_key = ed25519_keypair_from_pkcs8(ed25519::PK8_1).unwrap();
-        assert_eq!(key.public().as_bytes(), backend_key.public_key().as_ref());
-        assert_eq!(sig.value().as_bytes(), backend_key.sign(msg).as_ref());
+        assert_eq!(key.public().as_bytes(), backend_key.public_key());
+        assert_eq!(sig.value().as_bytes(), &backend_key.sign(msg)[..]);
 
         // Make sure verification fails with the wrong key.
         let bad_pub_key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2)
@@ -1497,8 +1471,8 @@ mod test {
 
         // Make sure we match what the crypto backend expects.
         let backend_key = ed25519_keypair_from_pkcs8(ed25519::PK8_1).unwrap();
-        assert_eq!(key.public().as_bytes(), backend_key.public_key().as_ref());
-        assert_eq!(sig.value().as_bytes(), backend_key.sign(msg).as_ref());
+        assert_eq!(key.public().as_bytes(), backend_key.public_key());
+        assert_eq!(sig.value().as_bytes(), &backend_key.sign(msg)[..]);
 
         // Make sure verification fails with the wrong key.
         let bad_pub_key = Ed25519PrivateKey::from_pkcs8(ed25519::PK8_2)
@@ -1792,7 +1766,7 @@ mod test {
     #[cfg(feature = "fips")]
     #[test]
     fn backend_is_in_fips_mode() {
-        crate::backend::try_fips_mode().unwrap();
+        assert!(provider::fips::provider().fips());
     }
 
     #[test]

@@ -6,8 +6,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use crate::backend::digest;
-use crate::crypto::{HashAlgorithm, HashValue};
+use crate::crypto::{DigestContext, HashAlgorithm, HashValue};
 use crate::Result;
 
 pub(crate) trait SafeAsyncRead: AsyncRead + Sized + Unpin {
@@ -106,7 +105,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for EnforceMinimumBitrate<R> {
 pub(crate) struct SafeReader<R> {
     inner: R,
     max_size: u64,
-    hashers: Vec<(digest::Context, HashValue)>,
+    hashers: Vec<(Box<dyn DigestContext>, HashValue)>,
     bytes_read: u64,
 }
 
@@ -147,7 +146,7 @@ impl<R: AsyncRead + Unpin> AsyncRead for SafeReader<R> {
         if read_bytes == 0 {
             for (context, expected_hash) in self.hashers.drain(..) {
                 let generated_hash = context.finish();
-                if generated_hash.as_ref() != expected_hash.value() {
+                if generated_hash.as_slice() != expected_hash.value() {
                     return Poll::Ready(Err(io::Error::new(
                         ErrorKind::InvalidData,
                         "Calculated hash did not match the required hash.",
@@ -179,7 +178,6 @@ impl<R: AsyncRead + Unpin> AsyncRead for SafeReader<R> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use digest::SHA256;
     use futures_executor::block_on;
     use futures_util::io::AsyncReadExt;
 
@@ -240,9 +238,9 @@ mod test {
     fn valid_read_good_hash() {
         block_on(async {
             let bytes: &[u8] = &[0x00, 0x01, 0x02, 0x03];
-            let mut context = digest::Context::new(&SHA256);
+            let mut context = HashAlgorithm::Sha256.digest_context().unwrap();
             context.update(bytes);
-            let hash_value = HashValue::new(context.finish().as_ref().to_vec());
+            let hash_value = HashValue::new(context.finish());
             let mut reader = SafeReader::new(
                 bytes,
                 bytes.len() as u64,
@@ -259,10 +257,10 @@ mod test {
     fn invalid_read_bad_hash() {
         block_on(async {
             let bytes: &[u8] = &[0x00, 0x01, 0x02, 0x03];
-            let mut context = digest::Context::new(&SHA256);
+            let mut context = HashAlgorithm::Sha256.digest_context().unwrap();
             context.update(bytes);
             context.update(&[0xFF]); // evil bytes
-            let hash_value = HashValue::new(context.finish().as_ref().to_vec());
+            let hash_value = HashValue::new(context.finish());
             let mut reader = SafeReader::new(
                 bytes,
                 bytes.len() as u64,
@@ -278,9 +276,9 @@ mod test {
     fn valid_read_good_hash_large_data() {
         block_on(async {
             let bytes: &[u8] = &[0x00; 64 * 1024];
-            let mut context = digest::Context::new(&SHA256);
+            let mut context = HashAlgorithm::Sha256.digest_context().unwrap();
             context.update(bytes);
-            let hash_value = HashValue::new(context.finish().as_ref().to_vec());
+            let hash_value = HashValue::new(context.finish());
             let mut reader = SafeReader::new(
                 bytes,
                 bytes.len() as u64,
@@ -297,10 +295,10 @@ mod test {
     fn invalid_read_bad_hash_large_data() {
         block_on(async {
             let bytes: &[u8] = &[0x00; 64 * 1024];
-            let mut context = digest::Context::new(&SHA256);
+            let mut context = HashAlgorithm::Sha256.digest_context().unwrap();
             context.update(bytes);
             context.update(&[0xFF]); // evil bytes
-            let hash_value = HashValue::new(context.finish().as_ref().to_vec());
+            let hash_value = HashValue::new(context.finish());
             let mut reader = SafeReader::new(
                 bytes,
                 bytes.len() as u64,

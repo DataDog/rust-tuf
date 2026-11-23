@@ -129,12 +129,22 @@ compile_error!(
     "tuf requires a crypto backend: enable the `ring` (default), `aws-lc-rs`, or `fips` feature"
 );
 
-#[cfg(all(feature = "aws-lc-rs", not(feature = "fips")))]
-pub(crate) use aws_lc_rs as backend;
-#[cfg(feature = "fips")]
-pub(crate) use aws_lc_rs_fips as backend;
-#[cfg(all(feature = "ring", not(any(feature = "aws-lc-rs", feature = "fips"))))]
-pub(crate) use ring as backend;
+// RSA signing is unstable and still uses one compile-time backend.
+#[cfg(all(
+    feature = "unstable_rsa",
+    any(
+        all(feature = "ring", feature = "aws-lc-rs"),
+        all(feature = "ring", feature = "fips"),
+        all(feature = "aws-lc-rs", feature = "fips"),
+    )
+))]
+compile_error!("`unstable_rsa` supports exactly one crypto backend feature");
+#[cfg(all(feature = "unstable_rsa", feature = "aws-lc-rs"))]
+pub(crate) use aws_lc_rs as rsa_backend;
+#[cfg(all(feature = "unstable_rsa", feature = "fips"))]
+pub(crate) use aws_lc_rs_fips as rsa_backend;
+#[cfg(all(feature = "unstable_rsa", feature = "ring"))]
+pub(crate) use ring as rsa_backend;
 
 pub use crate::database::*;
 pub use crate::error::*;
