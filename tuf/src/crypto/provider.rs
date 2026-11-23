@@ -185,14 +185,14 @@ backend_provider!(
 
 /// Every provider compiled into this build.
 pub fn compiled() -> Vec<&'static dyn CryptoProvider> {
-    let mut providers: Vec<&'static dyn CryptoProvider> = Vec::new();
-    #[cfg(feature = "ring")]
-    providers.push(ring::provider());
-    #[cfg(feature = "aws-lc-rs")]
-    providers.push(aws_lc_rs::provider());
-    #[cfg(feature = "fips")]
-    providers.push(fips::provider());
-    providers
+    vec![
+        #[cfg(feature = "ring")]
+        ring::provider(),
+        #[cfg(feature = "aws-lc-rs")]
+        aws_lc_rs::provider(),
+        #[cfg(feature = "fips")]
+        fips::provider(),
+    ]
 }
 
 static DEFAULT: std::sync::OnceLock<&'static dyn CryptoProvider> = std::sync::OnceLock::new();
